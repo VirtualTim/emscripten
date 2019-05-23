@@ -81,7 +81,6 @@ var LibraryPThreadStub = {
   },
 
   pthread_setcancelstate: function() { return 0; },
-  pthread_setcanceltype: function() { return 0; },
 
   pthread_cleanup_push: function(routine, arg) {
     __ATEXIT__.push(function() { {{{ makeDynCall('vi') }}}(routine, arg) })
