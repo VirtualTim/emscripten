@@ -117,27 +117,20 @@ void test() {
   rewinddir(dir);
   ent = readdir(dir);
   assert(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..") || !strcmp(ent->d_name, "file.txt"));
+  char first[1024];
+  //printf("first: %s\n", ent->d_name);
+  strcpy(first, ent->d_name);
   loc = telldir(dir);
-#ifndef __EMSCRIPTEN__
-  // TODO(https://github.com/emscripten-core/emscripten/issues/8526): Implement telldir/seekdir
-  assert(loc > 0);
-  //printf("loc=%d\n", loc);
-#endif
+  assert(loc >= 0);
   ent = readdir(dir);
-  char name_at_loc[1024];
-  strcpy(name_at_loc, ent->d_name);
-  //printf("name_at_loc: %s\n", name_at_loc);
   assert(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..") || !strcmp(ent->d_name, "file.txt"));
   ent = readdir(dir);
   assert(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..") || !strcmp(ent->d_name, "file.txt"));
   seekdir(dir, loc);
   ent = readdir(dir);
   assert(ent);
-#ifndef __EMSCRIPTEN__
-  // TODO(https://github.com/emscripten-core/emscripten/issues/8526: Implement telldir/seekdir
-  //printf("check: %s / %s\n", ent->d_name, name_at_loc);
-  assert(!strcmp(ent->d_name, name_at_loc));
-#endif
+  //printf("check: %s / %s\n", ent->d_name, first);
+  assert(!strcmp(ent->d_name, first));
 
   //
   // do a normal read with readdir_r
