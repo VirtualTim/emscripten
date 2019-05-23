@@ -1573,11 +1573,10 @@ int f() {
 
     # Verify that archive contains basenames with hashes to avoid duplication
     text = run_process([PYTHON, EMAR, 't', 'liba.a'], stdout=PIPE).stdout
-    self.assertEqual(text.count('common.o'), 1)
-    self.assertContained('common_', text)
+    self.assertNotIn('common.o', text)
+    assert text.count('common_') == 2, text
     for line in text.split('\n'):
-      # should not have huge hash names
-      self.assertLess(len(line), 20, line)
+      assert len(line) < 20, line # should not have huge hash names
 
     create_test_file('main.c', r'''
       void a(void);
