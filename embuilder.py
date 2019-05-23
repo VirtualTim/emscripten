@@ -45,6 +45,14 @@ SYSTEM_TASKS = [
     'compiler-rt',
     'emmalloc',
     'emmalloc_debug',
+    'gl',
+    'gl-emu',
+    'gl-emu-webgl2',
+    'gl-mt',
+    'gl-mt-emu',
+    'gl-mt-emu-webgl2',
+    'gl-mt-webgl2',
+    'gl-webgl2',
     'html5',
     'libc',
     'libc++',
@@ -61,12 +69,6 @@ for debug in ['', '_debug']:
     for threadsafe in ['', '_threadsafe']:
       for tracing in ['', '_tracing']:
         SYSTEM_TASKS += ['dlmalloc' + debug + noerrno + threadsafe + tracing]
-
-for mt in ['', '-mt']:
-  for emu in ['', '-emu']:
-    for webgl2 in ['', '-webgl2']:
-      for ofb in ['', '-ofb']:
-        SYSTEM_TASKS += ['gl' + mt + emu + webgl2 + ofb]
 
 USER_TASKS = [
     'binaryen',
@@ -280,8 +282,6 @@ def main():
         opts += ['-s', 'LEGACY_GL_EMULATION=1']
       if '-webgl2' in what:
         opts += ['-s', 'USE_WEBGL2=1']
-      if '-ofb' in what:
-        opts += ['-s', 'OFFSCREEN_FRAMEBUFFER=1']
       build('''
         extern "C" { extern void* emscripten_GetProcAddress(const char *x); }
         int main() {
