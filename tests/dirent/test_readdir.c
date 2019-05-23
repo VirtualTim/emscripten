@@ -183,6 +183,7 @@ void test_scandir() {
 }
 
 int main() {
+  printf("SIGILL: %s\n", strsignal(SIGILL));
   atexit(cleanup);
   signal(SIGABRT, cleanup);
   setup();

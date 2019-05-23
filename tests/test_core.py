@@ -129,7 +129,7 @@ class TestCoreBase(RunnerCore):
                           .format(test_path, ext_list))
       return ret
 
-    src = find_files('.c', '.cpp')
+    src = find_files('.c', '.cpp', '.cc')
     output = find_files('.out', '.txt')
     self.do_run_from_file(src, output, **kwargs)
 
@@ -161,7 +161,7 @@ class TestCoreBase(RunnerCore):
   def test_hello_world(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_hello_world')
 
-    src = open('src.c.o.js').read()
+    src = open('src.cpp.o.js').read()
     assert 'EMSCRIPTEN_GENERATED_FUNCTIONS' not in src, 'must not emit this unneeded internal thing'
 
   def test_intvars(self):
@@ -278,7 +278,7 @@ class TestCoreBase(RunnerCore):
     self.emcc_args += ['-g1']
     self.do_run_in_out_file_test('tests', 'core', 'test_lower_intrinsics')
     # intrinsics should be lowered out
-    js = open('src.c.o.js').read()
+    js = open('src.cpp.o.js').read()
     assert ('llvm_' not in js) == is_optimizing(self.emcc_args) or not self.is_wasm(), 'intrinsics must be lowered when optimizing'
 
   def test_bswap64(self):
@@ -556,7 +556,9 @@ class TestCoreBase(RunnerCore):
     self.do_run_in_out_file_test('tests', 'core', 'test_erf')
 
   def test_math_hyperbolic(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_math_hyperbolic')
+    src = open(path_from_root('tests', 'hyperbolic', 'src.c')).read()
+    expected = open(path_from_root('tests', 'hyperbolic', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_math_lgamma(self):
     self.do_run_in_out_file_test('tests', 'math', 'lgamma')
@@ -657,7 +659,7 @@ base align: 0, 0, 0, 0'''])
 
     self.do_run_in_out_file_test('tests', 'core', 'test_stack_restore')
 
-    generated = open('src.c.o.js').read()
+    generated = open('src.cpp.o.js').read()
 
     def ensure_stack_restore_count(function_name, expected_count):
       code = generated[generated.find(function_name):]
@@ -1319,7 +1321,7 @@ int main() {
       self.do_run_in_out_file_test('tests', 'core', 'test_polymorph')
 
   def test_complex(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_complex')
+    self.do_run_in_out_file_test('tests', 'core', 'test_complex', force_c=True)
 
   def test_float_builtins(self):
     # tests wasm_libc_rt
@@ -1391,7 +1393,7 @@ int main() {
     self.do_run_in_out_file_test('tests', 'core', 'test_alloca')
 
   def test_rename(self):
-    self.do_run_in_out_file_test('tests', 'stdio', 'test_rename')
+    self.do_run_in_out_file_test('tests', 'stdio', 'test_rename', force_c=True)
 
   def test_remove(self):
    # needs to flush stdio streams
@@ -1502,7 +1504,7 @@ int main() {
     if EMTEST_SKIP_SLOW and self.is_emterpreter() and not is_optimizing(self.emcc_args):
       return self.skipTest('skipping slow tests')
     self.emcc_args += ['-std=c99']
-    self.do_run_in_out_file_test('tests', 'life', args=['2'])
+    self.do_run_in_out_file_test('tests', 'life', args=['2'], force_c=True)
 
   def test_array2(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_array2')
@@ -2077,15 +2079,23 @@ The current type of b is: 9
     self.do_run(src, 'success', force_c=True)
 
   def test_time(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_time')
-    for tz in ['EST+05EDT', 'UTC+0']:
-      print('extra tz test:', tz)
-      with env_modify({'TZ': tz}):
-        # Run the test with different time zone settings if
-        # possible. It seems that the TZ environment variable does not
-        # work all the time (at least it's not well respected by
-        # Node.js on Windows), but it does no harm either.
-        self.do_run_in_out_file_test('tests', 'core', 'test_time')
+    src = open(path_from_root('tests', 'time', 'src.cpp')).read()
+    expected = open(path_from_root('tests', 'time', 'output.txt')).read()
+    self.do_run(src, expected)
+    if 'TZ' in os.environ:
+      print('TZ set in environment, skipping extra time zone checks')
+    else:
+      try:
+        for tz in ['EST+05EDT', 'UTC+0']:
+          print('extra tz test:', tz)
+          # Run the test with different time zone settings if
+          # possible. It seems that the TZ environment variable does not
+          # work all the time (at least it's not well respected by
+          # Node.js on Windows), but it does no harm either.
+          os.environ['TZ'] = tz
+          self.do_run(src, expected)
+      finally:
+        del os.environ['TZ']
 
   def test_timeb(self):
     # Confirms they are called in reverse order
@@ -4270,7 +4280,9 @@ Have even and odd!
     self.do_run_in_out_file_test('tests', 'core', 'test_strtok')
 
   def test_parseInt(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_parseInt')
+    src = open(path_from_root('tests', 'parseInt', 'src.c')).read()
+    expected = open(path_from_root('tests', 'parseInt', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_transtrcase(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_transtrcase')
@@ -4315,7 +4327,7 @@ Have even and odd!
       assert i > 0 and self.emcc_args[i - 1] == '-s'
       self.emcc_args[i] = 'ASSERTIONS=0'
       print('flip assertions off')
-    self.do_run_in_out_file_test('tests', 'core', 'test_fnmatch')
+    self.do_run_in_out_file_test('tests', 'core', 'fnmatch')
 
   def test_sscanf(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_sscanf')
@@ -4415,7 +4427,9 @@ Pass: 0.000012 0.000012''')
     self.do_run_in_out_file_test('tests', 'core', 'test_sscanf_float')
 
   def test_langinfo(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_langinfo')
+    src = open(path_from_root('tests', 'langinfo', 'test.c')).read()
+    expected = open(path_from_root('tests', 'langinfo', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_files(self):
     self.banned_js_engines = [SPIDERMONKEY_ENGINE] # closure can generate variables called 'gc', which pick up js shell stuff
@@ -4641,10 +4655,23 @@ main( int argv, char ** argc ) {
     self.do_run(src, '3\n')
 
   def test_readdir(self):
-    self.do_run_in_out_file_test('tests', 'dirent', 'test_readdir')
+    src = open(path_from_root('tests', 'dirent', 'test_readdir.c')).read()
+    self.do_run(src, '''SIGILL: Illegal instruction
+success
+n: 8
+name: tmp
+name: proc
+name: nocanread
+name: home
+name: foobar
+name: dev
+name: ..
+name: .
+''', force_c=True)
 
   def test_readdir_empty(self):
-    self.do_run_in_out_file_test('tests', 'dirent', 'test_readdir_empty')
+    src = open(path_from_root('tests', 'dirent', 'test_readdir_empty.c')).read()
+    self.do_run(src, 'success', force_c=True)
 
   def test_stat(self):
     src = open(path_from_root('tests', 'stat', 'test_stat.c')).read()
@@ -4668,14 +4695,20 @@ main( int argv, char ** argc ) {
 
   def test_fcntl(self):
     self.add_pre_run("FS.createDataFile('/', 'test', 'abcdef', true, true, false);")
-    self.do_run_in_out_file_test('tests', 'fcntl', 'test_fcntl')
+    src = open(path_from_root('tests', 'fcntl', 'src.c')).read()
+    expected = open(path_from_root('tests', 'fcntl', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_fcntl_open(self):
-    self.do_run_in_out_file_test('tests', 'fcntl', 'test_fcntl_open')
+    src = open(path_from_root('tests', 'fcntl-open', 'src.c')).read()
+    expected = open(path_from_root('tests', 'fcntl-open', 'output.txt')).read()
+    self.do_run(src, expected, force_c=True)
 
   def test_fcntl_misc(self):
     self.add_pre_run("FS.createDataFile('/', 'test', 'abcdef', true, true, false);")
-    self.do_run_in_out_file_test('tests', 'fcntl', 'test_fcntl_misc')
+    src = open(path_from_root('tests', 'fcntl-misc', 'src.c')).read()
+    expected = open(path_from_root('tests', 'fcntl-misc', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_poll(self):
     self.add_pre_run('''
@@ -5048,7 +5081,9 @@ main( int argv, char ** argc ) {
     ])
 
   def test_systypes(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_systypes')
+    src = open(path_from_root('tests', 'systypes', 'src.c')).read()
+    expected = open(path_from_root('tests', 'systypes', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_getloadavg(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_getloadavg')
@@ -5064,7 +5099,9 @@ PORT: 3979
 ''')
 
   def test_ctype(self):
-    self.do_run_in_out_file_test('tests', 'core', 'test_ctype')
+    src = open(path_from_root('tests', 'ctype', 'src.c')).read()
+    expected = open(path_from_root('tests', 'ctype', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_strcasecmp(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_strcasecmp')
@@ -5395,7 +5432,9 @@ return malloc(size);
     self.set_setting('TOTAL_MEMORY', 128 * 1024 * 1024)
     # needs to flush stdio streams
     self.set_setting('EXIT_RUNTIME', 1)
+
     self.do_run_in_out_file_test('tests', 'core', 'test_mmap')
+    self.do_run_in_out_file_test('tests', 'core', 'test_mmap', force_c=True)
 
   def test_mmap_file(self):
     for extra_args in [[], ['--no-heap-copy']]:
@@ -5994,7 +6033,7 @@ return malloc(size);
     # Add an ll hook, to force ll generation
     self.do_run_from_file(src, output, build_ll_hook=lambda x: False)
 
-    filename = 'src.c'
+    filename = 'src.cpp'
     do_autodebug(filename)
 
     # Compare to each other, and to expected output
@@ -7453,7 +7492,7 @@ extern "C" {
 
     def test():
       self.do_run_in_out_file_test('tests', 'core', 'test_hello_world')
-      js = open('src.c.o.js').read()
+      js = open('src.cpp.o.js').read()
       assert ('require(' in js) == ('node' in self.get_setting('ENVIRONMENT')), 'we should have require() calls only if node js specified'
 
     for engine in JS_ENGINES:
