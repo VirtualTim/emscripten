@@ -86,10 +86,15 @@ sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import shared
 
+DEBUG = os.environ.get('EMCC_DEBUG')
+if DEBUG == "0":
+  DEBUG = None
+
 QUIET = (__name__ != '__main__')
 
 def show(msg):
-  if shared.DEBUG or not QUIET:
+  global QUIET, DEBUG
+  if DEBUG or not QUIET:
     sys.stderr.write('gen_struct_info: ' + msg + '\n')
 
 # Try to load pycparser.
