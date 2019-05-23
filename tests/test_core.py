@@ -4175,9 +4175,12 @@ Have even and odd!
     self.do_run_in_out_file_test('tests', 'core', 'test_transtrcase')
 
   def test_printf(self):
+    self.banned_js_engines = [NODE_JS, V8_ENGINE] # SpiderMonkey and V8 do different things to float64 typed arrays, un-NaNing, etc.
     # needs to flush stdio streams
     self.set_setting('EXIT_RUNTIME', 1)
-    self.do_run_in_out_file_test('tests', 'printf', 'test')
+    src = open(path_from_root('tests', 'printf', 'test.c')).read()
+    expected = open(path_from_root('tests', 'printf', 'output.txt')).read()
+    self.do_run(src, expected)
 
   def test_printf_2(self):
     self.do_run_in_out_file_test('tests', 'core', 'test_printf_2')
