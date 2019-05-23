@@ -4619,30 +4619,15 @@ function minifyGlobals(ast) {
 
 
 function minifyLocals(ast) {
+  assert(asm);
   assert(extraInfo && extraInfo.globals);
 
   traverseGeneratedFunctions(ast, function(fun, type) {
-    // Find the list of local names, including params.
-    if (asm) {
-      // TODO: we can avoid modifying at all here - we just need a list of local vars+params
-      var asmData = normalizeAsm(fun);
-      denormalizeAsm(fun, asmData);
-    } else {
-      // non-asm.js code - scan the whole function, which is inefficient
-      var localNames = {};
-      for (var param in fun[2]) {
-        localNames[param] = 1;
-      }
-      traverse(ast, function(node, type) {
-        if (type === 'var') {
-          node[1].forEach(function(defn) {
-            var name = defn[0];
-            localNames[name] = 1;
-          });
-        }
-      });
-    }
 
+    // Analyse the asmjs to figure out local variable names,
+    // but operate on the original source tree so that we don't
+    // miss any global names in e.g. variable initializers.
+    var asmData = normalizeAsm(fun); denormalizeAsm(fun, asmData); // TODO: we can avoid modifying at all here - we just need a list of local vars+params
     var newNames = {};
     var usedNames = {};
 
@@ -4650,11 +4635,7 @@ function minifyLocals(ast) {
     // pre-assigned names.  Don't actually minify them yet
     // as that might interfere with local variable names.
     function isLocalName(name) {
-      if (asm) {
-        return name in asmData.vars || name in asmData.params;
-      } else {
-        return name in localNames;
-      }
+      return name in asmData.vars || name in asmData.params;
     }
     traverse(fun, function(node, type) {
       if (type === 'name') {
