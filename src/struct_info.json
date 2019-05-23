@@ -868,7 +868,6 @@
         "defines": [
             "EOF", 
             "SEEK_END", 
-            "SEEK_CUR", 
             "SEEK_SET"
         ],
         "structs": {}
