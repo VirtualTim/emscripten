@@ -1674,7 +1674,8 @@ def create_the_global(metadata):
 
 RUNTIME_ASSERTIONS = '''
   assert(runtimeInitialized, 'you need to wait for the runtime to be ready (e.g. wait for main() to be called)');
-  assert(!runtimeExited, 'the runtime was exited (use NO_EXIT_RUNTIME to keep it alive after main() exits)');'''
+  assert(!runtimeExited, 'the runtime was exited (use NO_EXIT_RUNTIME to keep it alive after main() exits)');
+'''
 
 
 def create_receiving(function_table_data, function_tables_defs, exported_implemented_functions, initializers):
@@ -1685,17 +1686,10 @@ def create_receiving(function_table_data, function_tables_defs, exported_impleme
     runtime_assertions = RUNTIME_ASSERTIONS
     # assert on the runtime being in a valid state when calling into compiled code. The only exceptions are
     # some support code
-    receiving_functions = [f for f in exported_implemented_functions if f not in ('_memcpy', '_memset', '_emscripten_replace_memory', '__start_module')]
-
-    wrappers = []
-    for name in receiving_functions:
-      wrappers.append('''\
-var real_%(name)s = asm["%(name)s"];
-asm["%(name)s"] = function() {%(runtime_assertions)s
-  return real_%(name)s.apply(null, arguments);
+    receiving = [f for f in exported_implemented_functions if f not in ('_memcpy', '_memset', '_emscripten_replace_memory', '__start_module')]
+    receiving = '\n'.join('var real_' + s + ' = asm["' + s + '"]; asm["' + s + '''"] = function() {''' + runtime_assertions + '''  return real_''' + s + '''.apply(null, arguments);
 };
-''' % {'name': name, 'runtime_assertions': runtime_assertions})
-    receiving = '\n'.join(wrappers)
+''' for s in receiving)
 
   shared.Settings.MODULE_EXPORTS = module_exports = exported_implemented_functions + function_tables(function_table_data)
 
@@ -1737,15 +1731,7 @@ asm["%(name)s"] = function() {%(runtime_assertions)s
 
       receiving += 'for(var __exportedFunc in asm) ' + global_object + '[__exportedFunc] = ' + module_assign + 'asm[__exportedFunc];\n'
   else:
-    receiving += 'Module["asm"] = asm;\n'
-    wrappers = []
-    for name in module_exports:
-      wrappers.append('''\
-var %(name)s = Module["%(name)s"] = function() {%(runtime_assertions)s
-  return Module["asm"]["%(name)s"].apply(null, arguments)
-};
-''' % {'name': name, 'runtime_assertions': runtime_assertions})
-    receiving += '\n'.join(wrappers)
+    receiving += 'Module["asm"] = asm;\n' + '\n'.join(['var ' + s + ' = Module["' + s + '"] = function() {' + runtime_assertions + '  return Module["asm"]["' + s + '"].apply(null, arguments) };' for s in module_exports]) + '\n'
 
   if shared.Settings.EXPORT_FUNCTION_TABLES and not shared.Settings.WASM:
     for table in function_table_data.values():
@@ -2431,12 +2417,9 @@ def create_receiving_wasm(exports):
     # assert on the runtime being in a valid state when calling into compiled code. The only exceptions are
     # some support code
     for e in exports:
-      receiving.append('''\
-var real_%(mangled)s = asm["%(e)s"];
-asm["%(e)s"] = function() {%(assertions)s
-  return real_%(mangled)s.apply(null, arguments);
-};
-''' % {'mangled': asmjs_mangle(e), 'e': e, 'assertions': runtime_assertions})
+      receiving.append('''var real_%(mangled)s = asm["%(e)s"]; asm["%(e)s"] = function() { %(assertions)s
+return real_%(mangled)s.apply(null, arguments);
+};''' % {'mangled': asmjs_mangle(e), 'e': e, 'assertions': runtime_assertions})
 
   if not shared.Settings.SWAPPABLE_ASM_MODULE:
     for e in exports:
@@ -2444,11 +2427,7 @@ asm["%(e)s"] = function() {%(assertions)s
   else:
     receiving.append('Module["asm"] = asm;')
     for e in exports:
-      receiving.append('''\
-var %(mangled)s = Module["%(mangled)s"] = function() {%(assertions)s
-  return Module["asm"]["%(e)s"].apply(null, arguments)
-};
-''' % {'mangled': asmjs_mangle(e), 'e': e, 'assertions': runtime_assertions})
+      receiving.append('var %(mangled)s = Module["%(mangled)s"] = function() { %(assertions)s return Module["asm"]["%(e)s"].apply(null, arguments) };' % {'mangled': asmjs_mangle(e), 'e': e, 'assertions': runtime_assertions})
 
   return '\n'.join(receiving) + '\n'
 
