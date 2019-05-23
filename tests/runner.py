@@ -407,9 +407,6 @@ class RunnerCore(unittest.TestCase):
       self.clear_setting(key)
     self.settings_mods[key] = value
 
-  def has_changed_setting(self, key):
-    return key in self.settings_mods
-
   def clear_setting(self, key):
     self.settings_mods.pop(key, None)
 
@@ -493,19 +490,9 @@ class RunnerCore(unittest.TestCase):
 
     return output_obj
 
-  # returns the full list of arguments to pass to emcc
-  # param @main_file whether this is the main file of the test. some arguments
-  #                  (like --pre-js) do not need to be passed when building
-  #                  libraries, for example
-  def get_emcc_args(self, main_file=False):
-    args = self.serialize_settings() + self.emcc_args
-    if not main_file:
-      for i, arg in enumerate(args):
-        if arg in ('--pre-js', '--post-js'):
-          args[i] = None
-          args[i + 1] = None
-      args = [arg for arg in args if arg is not None]
-    return args
+  def get_emcc_args(self):
+    # TODO(sbc): We should probably unify Building.COMPILER_TEST_OPTS and self.emcc_args
+    return self.serialize_settings() + self.emcc_args + Building.COMPILER_TEST_OPTS
 
   # Build JavaScript code from source code
   def build(self, src, dirname, filename, main_file=None,
@@ -545,7 +532,7 @@ class RunnerCore(unittest.TestCase):
           os.remove(f + '.o')
         except:
           pass
-        args = [PYTHON, EMCC] + self.get_emcc_args(main_file=True) + \
+        args = [PYTHON, EMCC] + self.get_emcc_args() + \
                ['-I', dirname, '-I', os.path.join(dirname, 'include')] + \
                ['-I' + include for include in includes] + \
                ['-c', f, '-o', f + '.o']
@@ -566,7 +553,7 @@ class RunnerCore(unittest.TestCase):
       self.prep_ll_file(filename, object_file, build_ll_hook=build_ll_hook)
 
       # BC => JS
-      Building.emcc(object_file, self.get_emcc_args(main_file=True), object_file + '.js')
+      Building.emcc(object_file, self.get_emcc_args(), object_file + '.js')
     else:
       # "fast", new path: just call emcc and go straight to JS
       all_files = [filename] + additional_files + libraries
@@ -574,7 +561,7 @@ class RunnerCore(unittest.TestCase):
         if '.' not in all_files[i]:
           shutil.move(all_files[i], all_files[i] + '.bc')
           all_files[i] += '.bc'
-      args = [PYTHON, EMCC] + self.get_emcc_args(main_file=True) + \
+      args = [PYTHON, EMCC] + self.get_emcc_args() + \
           ['-I', dirname, '-I', os.path.join(dirname, 'include')] + \
           ['-I' + include for include in includes] + \
           all_files + ['-o', filename + suffix]
@@ -776,10 +763,8 @@ class RunnerCore(unittest.TestCase):
     build_dir = self.get_build_dir()
     output_dir = self.get_dir()
 
-    emcc_args = self.get_emcc_args()
-
-    hash_input = (str(emcc_args) + ' $ ' + str(env_init)).encode('utf-8')
-    cache_name = name + ','.join([opt for opt in emcc_args if len(opt) < 7]) + '_' + hashlib.md5(hash_input).hexdigest() + cache_name_extra
+    hash_input = (str(Building.COMPILER_TEST_OPTS) + ' $ ' + str(env_init)).encode('utf-8')
+    cache_name = name + ','.join([opt for opt in Building.COMPILER_TEST_OPTS if len(opt) < 7]) + '_' + hashlib.md5(hash_input).hexdigest() + cache_name_extra
 
     valid_chars = "_%s%s" % (string.ascii_letters, string.digits)
     cache_name = ''.join([(c if c in valid_chars else '_') for c in cache_name])
@@ -798,7 +783,7 @@ class RunnerCore(unittest.TestCase):
 
     return build_library(name, build_dir, output_dir, generated_libs, configure,
                          configure_args, make, make_args, self.library_cache,
-                         cache_name, env_init=env_init, native=native, cflags=self.get_emcc_args())
+                         cache_name, env_init=env_init, native=native)
 
   def clear(self):
     for name in os.listdir(self.get_dir()):
@@ -1049,6 +1034,8 @@ class RunnerCore(unittest.TestCase):
       test_index += 1
 
   def get_freetype_library(self):
+    self.set_setting('DEAD_FUNCTIONS', self.get_setting('DEAD_FUNCTIONS') + ['_inflateEnd', '_inflate', '_inflateReset', '_inflateInit2_'])
+
     return self.get_library('freetype', os.path.join('objs', '.libs', 'libfreetype.a'), configure_args=['--disable-shared'])
 
   def get_poppler_library(self):
@@ -1056,7 +1043,7 @@ class RunnerCore(unittest.TestCase):
     # e.g. FcConfigSubstitute
     self.set_setting('ERROR_ON_UNDEFINED_SYMBOLS', 0)
 
-    self.emcc_args += [
+    Building.COMPILER_TEST_OPTS += [
       '-I' + path_from_root('tests', 'freetype', 'include'),
       '-I' + path_from_root('tests', 'poppler', 'include')
     ]
@@ -1065,7 +1052,7 @@ class RunnerCore(unittest.TestCase):
 
     # Poppler has some pretty glaring warning.  Suppress them to keep the
     # test output readable.
-    self.emcc_args += [
+    Building.COMPILER_TEST_OPTS += [
       '-Wno-sentinel',
       '-Wno-logical-not-parentheses',
       '-Wno-unused-private-field',
@@ -1483,8 +1470,7 @@ def build_library(name,
                   cache=None,
                   cache_name=None,
                   env_init={},
-                  native=False,
-                  cflags=[]):
+                  native=False):
   """Build a library into a .bc file. We build the .bc file once and cache it
   for all our tests. (We cache in memory since the test directory is destroyed
   and recreated for each test. Note that we cache separately for different
@@ -1504,7 +1490,7 @@ def build_library(name,
 
   with chdir(project_dir):
     generated_libs = [os.path.join(project_dir, lib) for lib in generated_libs]
-    env = Building.get_building_env(native, True, cflags=cflags)
+    env = Building.get_building_env(native, True)
     for k, v in env_init.items():
       env[k] = v
     if configure:
