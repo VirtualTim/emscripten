@@ -872,12 +872,7 @@ class Ports(object):
           Ports.clear_project_build(name)
           return
 
-    if is_tarbz2:
-      fullpath = fullname + '.tar.bz2'
-    elif url.endswith('.tar.gz'):
-      fullpath = fullname + '.tar.gz'
-    else:
-      fullpath = fullname + '.zip'
+    fullpath = fullname + ('.tar.bz2' if is_tarbz2 else '.zip')
 
     if name not in Ports.name_cache: # only mention each port once in log
       logger.debug('including port: ' + name)
@@ -904,8 +899,6 @@ class Ports(object):
     def check_tag():
       if is_tarbz2:
         names = tarfile.open(fullpath, 'r:bz2').getnames()
-      elif url.endswith('.tar.gz'):
-        names = tarfile.open(fullpath, 'r:gz').getnames()
       else:
         names = zipfile.ZipFile(fullpath, 'r').namelist()
 
@@ -918,8 +911,6 @@ class Ports(object):
       shared.safe_ensure_dirs(fullname)
       if is_tarbz2:
         z = tarfile.open(fullpath, 'r:bz2')
-      elif url.endswith('.tar.gz'):
-        z = tarfile.open(fullpath, 'r:gz')
       else:
         z = zipfile.ZipFile(fullpath, 'r')
       try:
