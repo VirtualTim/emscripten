@@ -726,13 +726,6 @@ Paths
   :returns: The current working directory.
 
 
-.. js:function:: FS.chdir(path)
-
-  Sets the current working directory.
-
-  :param string path: The path to set as current working directory.
-
-
 .. js:function:: FS.lookupPath(path, opts)
 
   Looks up the incoming path and returns an object containing both the resolved path and node.
