@@ -11,6 +11,16 @@ var SDL;
 /**
  * @suppress {duplicate, undefinedVars}
  */
+var GL;
+
+/**
+ * @suppress {duplicate, undefinedVars}
+ */
+var GLctx;
+
+/**
+ * @suppress {duplicate, undefinedVars}
+ */
 var SOCKFS;
 
 /**
