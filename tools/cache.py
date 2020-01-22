@@ -10,7 +10,7 @@ import shutil
 import logging
 from . import tempfiles, filelock
 
-logger = logging.getLogger('emscripten')
+logger = logging.getLogger('cache')
 
 
 # Permanent cache for dlmalloc and stdlibc++
@@ -43,19 +43,25 @@ class Cache(object):
 
     # if relevant, use a subdir of the cache
     if use_subdir:
-      if not shared.Settings.WASM_BACKEND:
-        dirname = os.path.join(dirname, 'asmjs')
-      elif shared.Settings.WASM_OBJECT_FILES:
-        dirname = os.path.join(dirname, 'wasm_o')
+      if shared.Settings.WASM_BACKEND:
+        subdir = 'wasm'
+        if shared.Settings.WASM_OBJECT_FILES:
+          subdir += '-obj'
+        else:
+          subdir += '-bc'
+        if shared.Settings.RELOCATABLE:
+          subdir += '-pic'
       else:
-        dirname = os.path.join(dirname, 'wasm_bc')
+        subdir = 'asmjs'
+      dirname = os.path.join(dirname, subdir)
+
     self.dirname = dirname
     self.debug = 'EM_CACHE_DEBUG' in os.environ
     self.acquired_count = 0
 
   def acquire_cache_lock(self):
     if not self.EM_EXCLUSIVE_CACHE_ACCESS and self.acquired_count == 0:
-      logger.debug('Cache: PID %s acquiring multiprocess file lock to Emscripten cache at %s' % (str(os.getpid()), self.dirname))
+      logger.debug('PID %s acquiring multiprocess file lock to Emscripten cache at %s' % (str(os.getpid()), self.dirname))
       try:
         self.filelock.acquire(60)
       except filelock.Timeout:
@@ -66,7 +72,7 @@ class Cache(object):
 
       self.prev_EM_EXCLUSIVE_CACHE_ACCESS = os.environ.get('EM_EXCLUSIVE_CACHE_ACCESS')
       os.environ['EM_EXCLUSIVE_CACHE_ACCESS'] = '1'
-      logger.debug('Cache: done')
+      logger.debug('done')
     self.acquired_count += 1
 
   def release_cache_lock(self):
@@ -78,7 +84,7 @@ class Cache(object):
       else:
         del os.environ['EM_EXCLUSIVE_CACHE_ACCESS']
       self.filelock.release()
-      logger.debug('Cache: PID %s released multiprocess file lock to Emscripten cache at %s' % (str(os.getpid()), self.dirname))
+      logger.debug('PID %s released multiprocess file lock to Emscripten cache at %s' % (str(os.getpid()), self.dirname))
 
   def ensure(self):
     self.acquire_cache_lock()
@@ -96,17 +102,26 @@ class Cache(object):
   def get_path(self, shortname):
     return os.path.join(self.dirname, shortname)
 
+  def erase_file(self, shortname):
+    name = os.path.join(self.dirname, shortname)
+    if os.path.exists(name):
+      logging.info('Cache: deleting cached file: %s', name)
+      tempfiles.try_delete(name)
+
   # Request a cached file. If it isn't in the cache, it will be created with
   # the given creator function
-  def get(self, shortname, creator, extension='.bc', what=None, force=False):
-    if not shortname.endswith(extension):
-      shortname += extension
+  def get(self, shortname, creator, what=None, force=False):
     cachename = os.path.abspath(os.path.join(self.dirname, shortname))
 
     self.acquire_cache_lock()
     try:
       if os.path.exists(cachename) and not force:
         return cachename
+      # it doesn't exist yet, create it
+      if shared.FROZEN_CACHE:
+        # it's ok to build small .txt marker files like "vanilla"
+        if not shortname.endswith('.txt'):
+          raise Exception('FROZEN_CACHE disallows building system libs: %s' % shortname)
       if what is None:
         if shortname.endswith(('.bc', '.so', '.a')):
           what = 'system library'
@@ -117,6 +132,7 @@ class Cache(object):
       self.ensure()
       temp = creator()
       if os.path.normcase(temp) != os.path.normcase(cachename):
+        shared.safe_ensure_dirs(os.path.dirname(cachename))
         shutil.copyfile(temp, cachename)
       logger.info(' - ok')
     finally:

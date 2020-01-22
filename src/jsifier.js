@@ -40,53 +40,29 @@ var proxiedFunctionInvokers = {};
 // But we can avoid emitting all the others in many cases.
 var NEED_ALL_ASM2WASM_IMPORTS = BINARYEN_TRAP_MODE == 'js';
 
-// used internally. set when there is a main() function.
-// also set when in a linkable module, as the main() function might
+// Used internally. set when there is a main() function.
+// Also set when in a linkable module, as the main() function might
 // arrive from a dynamically-linked library, and not necessarily
 // the current compilation unit.
-var HAS_MAIN = ('_main' in IMPLEMENTED_FUNCTIONS) || MAIN_MODULE || SIDE_MODULE;
+// Also set for STANDALONE_WASM since the _start function is needed to call
+// static ctors, even if there is no user main.
+var HAS_MAIN = ('_main' in IMPLEMENTED_FUNCTIONS) || MAIN_MODULE || SIDE_MODULE || STANDALONE_WASM;
+
+// Mangles the given C/JS side function name to assembly level function name (adds an underscore)
+function mangleCSymbolName(f) {
+  return f[0] == '$' ? f.substr(1) : '_' + f;
+}
+
+// Reverses C/JS name mangling: _foo -> foo, and foo -> $foo.
+function demangleCSymbolName(f) {
+  return f[0] == '_' ? f.substr(1) : '$' + f;
+}
 
 // JSifier
 function JSify(data, functionsOnly) {
   var mainPass = !functionsOnly;
 
   var itemsDict = { type: [], GlobalVariableStub: [], functionStub: [], function: [], GlobalVariable: [], GlobalVariablePostSet: [] };
-
-  if (mainPass) {
-    var shellFile = SHELL_FILE ? SHELL_FILE : (SIDE_MODULE ? 'shell_sharedlib.js' : (MINIMAL_RUNTIME ? 'shell_minimal.js' : 'shell.js'));
-
-    // We will start to print out the data, but must do so carefully - we are
-    // dealing with potentially *huge* strings. Convenient replacements and
-    // manipulations may create in-memory copies, and we may OOM.
-    //
-    // Final shape that will be created:
-    //    shell
-    //      (body)
-    //        preamble
-    //          runtime
-    //        generated code
-    //        postamble
-    //          global_vars
-    //
-    // First, we print out everything until the generated code. Then the
-    // functions will print themselves out as they are parsed. Finally, we
-    // will call finalCombiner in the main pass, to print out everything
-    // else. This lets us not hold any strings in memory, we simply print
-    // things out as they are ready.
-
-    var shellParts = read(shellFile).split('{{BODY}}');
-    print(processMacros(preprocess(shellParts[0], shellFile)));
-    var pre;
-    if (SIDE_MODULE) {
-      pre = processMacros(preprocess(read('preamble_sharedlib.js'), 'preamble_sharedlib.js'));
-    } else if (MINIMAL_RUNTIME) {
-      pre = processMacros(preprocess(read('preamble_minimal.js'), 'preamble_minimal.js'));
-    } else {
-      pre = processMacros(preprocess(read('support.js'), 'support.js')) +
-            processMacros(preprocess(read('preamble.js'), 'preamble.js'));
-    }
-    print(pre);
-  }
 
   if (mainPass) {
     // Add additional necessary items for the main pass. We can now do this since types are parsed (types can be used through
@@ -107,14 +83,8 @@ function JSify(data, functionsOnly) {
       libFuncsToInclude = DEFAULT_LIBRARY_FUNCS_TO_INCLUDE;
     }
     libFuncsToInclude.forEach(function(ident) {
-      var finalName = '_' + ident;
-      if (ident[0] === '$') {
-        finalName = ident.substr(1);
-      }
       data.functionStubs.push({
-        intertype: 'functionStub',
-        finalName: finalName,
-        ident: '_' + ident
+        ident: mangleCSymbolName(ident)
       });
     });
   }
@@ -129,26 +99,35 @@ function JSify(data, functionsOnly) {
 
     // name the function; overwrite if it's already named
     snippet = snippet.replace(/function(?:\s+([^(]+))?\s*\(/, 'function ' + finalName + '(');
-    if (LIBRARY_DEBUG && !LibraryManager.library[ident + '__asm']) {
-      snippet = snippet.replace('{', '{ var ret = (function() { if (runtimeDebug) err("[library call:' + finalName + ': " + Array.prototype.slice.call(arguments).map(prettyPrint) + "]"); ');
-      snippet = snippet.substr(0, snippet.length-1) + '}).apply(this, arguments); if (runtimeDebug && typeof ret !== "undefined") err("  [     return:" + prettyPrint(ret)); return ret; \n}';
+    // Apply special js library debug modes
+    if (!LibraryManager.library[ident + '__asm']) {
+      // apply LIBRARY_DEBUG if relevant
+      if (LIBRARY_DEBUG) {
+        snippet = modifyFunction(snippet, function(name, args, body) {
+          return 'function ' + name + '(' + args + ') {\n' +
+                 'var ret = (function() { if (runtimeDebug) err("[library call:' + finalName + ': " + Array.prototype.slice.call(arguments).map(prettyPrint) + "]");\n' +
+                  body +
+                  '}).apply(this, arguments); if (runtimeDebug && typeof ret !== "undefined") err("  [     return:" + prettyPrint(ret)); return ret; \n}\n';
+        });
+      }
     }
     return snippet;
   }
 
   // functionStub
   function functionStubHandler(item) {
-    // special logic
+    // In LLVM, exceptions generate a set of functions of form __cxa_find_matching_catch_1(), __cxa_find_matching_catch_2(), etc.
+    // where the number specifies the number of arguments. In Emscripten, route all these to a single function '__cxa_find_matching_catch'
+    // that variadically processes all of these functions using JS 'arguments' object.
     if (item.ident.startsWith('___cxa_find_matching_catch_')) {
+      if (DISABLE_EXCEPTION_THROWING) {
+        error('DISABLE_EXCEPTION_THROWING was set (likely due to -fno-exceptions), which means no C++ exception throwing support code is linked in, but exception catching code appears. Either do not set DISABLE_EXCEPTION_THROWING (if you do want exception throwing) or compile all source files with -fno-except (so that no exceptions support code is required); also make sure DISABLE_EXCEPTION_CATCHING is set to the right value - if you want exceptions, it should be off, and vice versa.');
+        return;
+      }
       var num = +item.ident.split('_').slice(-1)[0];
-      LibraryManager.library[item.ident.substr(1)] = function() {
-        return ___cxa_find_matching_catch.apply(null, arguments);
-      };
-    }
-
-    // note the signature
-    if (item.returnType && item.params) {
-      functionStubSigs[item.ident] = Functions.getSignature(item.returnType.text, item.params.map(function(arg) { return arg.type }), false);
+      addCxaCatch(num);
+      // Continue, with the code below emitting the proper JavaScript based on
+      // what we just added to the library.
     }
 
     function addFromLibrary(ident) {
@@ -163,12 +142,7 @@ function JSify(data, functionsOnly) {
         return '';
       }
 
-      // $ident's are special, we do not prefix them with a '_'.
-      if (ident[0] === '$') {
-        var finalName = ident.substr(1);
-      } else {
-        var finalName = '_' + ident;
-      }
+      var finalName = mangleCSymbolName(ident);
 
       // if the function was implemented in compiled code, we just need to export it so we can reach it from JS
       if (finalName in IMPLEMENTED_FUNCTIONS) {
@@ -185,31 +159,47 @@ function JSify(data, functionsOnly) {
 
       if (allExternPrimitives.indexOf(ident) != -1) {
         usedExternPrimitives[ident] = 1;
+        return;
       } else if ((!LibraryManager.library.hasOwnProperty(ident) && !LibraryManager.library.hasOwnProperty(ident + '__inline')) || SIDE_MODULE) {
-        if (!(finalName in IMPLEMENTED_FUNCTIONS)) {
-          if (VERBOSE || ident.substr(0, 11) !== 'emscripten_') { // avoid warning on emscripten_* functions which are for internal usage anyhow
-            if (!LINKABLE) {
-              if (ERROR_ON_UNDEFINED_SYMBOLS) {
-                error('undefined symbol: ' + ident);
-                warnOnce('To disable errors for undefined symbols use `-s ERROR_ON_UNDEFINED_SYMBOLS=0`')
-              } else if (VERBOSE || WARN_ON_UNDEFINED_SYMBOLS) {
-                warn('undefined symbol: ' + ident);
-              }
-            }
+        if (!(finalName in IMPLEMENTED_FUNCTIONS) && !LINKABLE) {
+          if (ERROR_ON_UNDEFINED_SYMBOLS) {
+            error('undefined symbol: ' + ident);
+            warnOnce('To disable errors for undefined symbols use `-s ERROR_ON_UNDEFINED_SYMBOLS=0`')
+          } else if (VERBOSE || WARN_ON_UNDEFINED_SYMBOLS) {
+            warn('undefined symbol: ' + ident);
           }
         }
-        if (!(MAIN_MODULE || SIDE_MODULE)) {
+        if (!RELOCATABLE) {
           // emit a stub that will fail at runtime
-          LibraryManager.library[shortident] = new Function("err('missing function: " + shortident + "'); abort(-1);");
+          LibraryManager.library[ident] = new Function("err('missing function: " + ident + "'); abort(-1);");
         } else {
-          var target = (MAIN_MODULE ? '' : 'parent') + "Module['_" + shortident + "']";
+          var isGlobalAccessor = ident.startsWith('g$');
+          var realIdent = ident;
+          if (isGlobalAccessor) {
+            realIdent = realIdent.substr(2);
+          }
+
+          var target = (SIDE_MODULE ? 'parent' : '') + "Module['" + mangleCSymbolName(realIdent) + "']";
           var assertion = '';
-          if (ASSERTIONS) assertion = 'if (!' + target + ') abort("external function \'' + shortident + '\' is missing. perhaps a side module was not linked in? if this function was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment");';
-          LibraryManager.library[shortident] = new Function(assertion + "return " + target + ".apply(null, arguments);");
+          if (ASSERTIONS) {
+            var what = 'function';
+            if (isGlobalAccessor) {
+              what = 'global';
+            }
+            assertion += 'if (!' + target + ') abort("external ' + what + ' \'' + realIdent + '\' is missing. perhaps a side module was not linked in? if this function was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment");\n';
+
+          }
+          var functionBody;
+          if (isGlobalAccessor) {
+            functionBody = assertion + "return " + target + ";"
+          } else {
+            functionBody = assertion + "return " + target + ".apply(null, arguments);";
+          }
+          LibraryManager.library[ident] = new Function(functionBody);
           if (SIDE_MODULE) {
             // no dependencies, just emit the thunk
             Functions.libraryFunctions[finalName] = 1;
-            return processLibraryFunction(LibraryManager.library[shortident], ident, finalName);
+            return processLibraryFunction(LibraryManager.library[ident], ident, finalName);
           }
           noExport = true;
         }
@@ -225,18 +215,20 @@ function JSify(data, functionsOnly) {
       var isFunction = false;
 
       if (typeof snippet === 'string') {
-        var target = LibraryManager.library[snippet];
-        if (target) {
-          // Redirection for aliases. We include the parent, and at runtime make ourselves equal to it.
-          // This avoid having duplicate functions with identical content.
-          redirectedIdent = snippet;
-          deps.push(snippet);
-          snippet = '_' + snippet;
-        }
-        // In asm, we need to know about library functions. If there is a target, though, then no
-        // need to consider this a library function - we will call directly to it anyhow
-        if (!redirectedIdent && (typeof target == 'function' || /Math_\w+/.exec(snippet))) {
-          Functions.libraryFunctions[finalName] = 1;
+        if (snippet[0] != '=') {
+          var target = LibraryManager.library[snippet];
+          if (target) {
+            // Redirection for aliases. We include the parent, and at runtime make ourselves equal to it.
+            // This avoid having duplicate functions with identical content.
+            redirectedIdent = snippet;
+            deps.push(snippet);
+            snippet = mangleCSymbolName(snippet);
+          }
+          // In asm, we need to know about library functions. If there is a target, though, then no
+          // need to consider this a library function - we will call directly to it anyhow
+          if (!redirectedIdent && (typeof target == 'function' || /Math_\w+/.exec(snippet))) {
+            Functions.libraryFunctions[finalName] = 1;
+          }
         }
       } else if (typeof snippet === 'object') {
         snippet = stringifyWithFunctions(snippet);
@@ -248,12 +240,18 @@ function JSify(data, functionsOnly) {
 
       var postsetId = ident + '__postset';
       var postset = LibraryManager.library[postsetId];
-      if (postset && !addedLibraryItems[postsetId] && !SIDE_MODULE) {
-        addedLibraryItems[postsetId] = true;
-        itemsDict.GlobalVariablePostSet.push({
-          intertype: 'GlobalVariablePostSet',
-          JS: postset + ';'
-        });
+      if (postset) {
+        // A postset is either code to run right now, or some text we should emit.
+        // If it's code, it may return some text to emit as well.
+        if (typeof postset === 'function') {
+          postset = postset();
+        }
+        if (postset && !addedLibraryItems[postsetId] && !SIDE_MODULE) {
+          addedLibraryItems[postsetId] = true;
+          itemsDict.GlobalVariablePostSet.push({
+            JS: postset + ';'
+          });
+        }
       }
 
       if (redirectedIdent) {
@@ -281,24 +279,27 @@ function JSify(data, functionsOnly) {
           }
           var sync = proxyingMode === 'sync';
           assert(typeof original === 'function');
-          var hasArgs = original.length > 0;
-          if (hasArgs) {
-            // If the function takes parameters, forward those to the proxied function call
-            var processedSnippet = snippet.replace(/function\s+(.*)?\s*\((.*?)\)\s*{/, 'function $1($2) {\nif (ENVIRONMENT_IS_PTHREAD) return _emscripten_proxy_to_main_thread_js(' + proxiedFunctionTable.length + ', ' + (+sync) + ', $2);');
-          } else {
-            // No parameters to the function
-            var processedSnippet = snippet.replace(/function\s+(.*)?\s*\((.*?)\)\s*{/, 'function $1() {\nif (ENVIRONMENT_IS_PTHREAD) return _emscripten_proxy_to_main_thread_js(' + proxiedFunctionTable.length + ', ' + (+sync) + ');');
-          }
-          if (processedSnippet == snippet) throw 'Failed to regex parse function to add pthread proxying preamble to it! Function: ' + snippet;
-          contentText = processedSnippet;
+          contentText = modifyFunction(snippet, function(name, args, body) {
+            return 'function ' + name + '(' + args + ') {\n' +
+                   'if (ENVIRONMENT_IS_PTHREAD) return _emscripten_proxy_to_main_thread_js(' + proxiedFunctionTable.length + ', ' + (+sync) + (args ? ', ' : '') + args + ');\n' + body + '}\n';
+          });
           proxiedFunctionTable.push(finalName);
         } else {
           contentText = snippet; // Regular JS function that will be executed in the context of the calling thread.
         }
       } else if (typeof snippet === 'string' && snippet.indexOf(';') == 0) {
+        // In JS libraries
+        //   foo: ';[code here verbatim]'
+        //  emits
+        //   'var foo;[code here verbatim];'
         contentText = 'var ' + finalName + snippet;
         if (snippet[snippet.length-1] != ';' && snippet[snippet.length-1] != '}') contentText += ';';
       } else {
+        // In JS libraries
+        //   foo: '=[value]'
+        //  emits
+        //   'var foo = [value];'
+        if (typeof snippet === 'string' && snippet[0] == '=') snippet = snippet.substr(1);
         contentText = 'var ' + finalName + '=' + snippet + ';';
       }
       var sig = LibraryManager.library[ident + '__sig'];
@@ -321,7 +322,7 @@ function JSify(data, functionsOnly) {
         // We set EXPORTED_FUNCTIONS here to tell emscripten.py to do that.
         deps.forEach(function(dep) {
           if (LibraryManager.library[dep + '__asm']) {
-            EXPORTED_FUNCTIONS['_' + dep] = 0;
+            EXPORTED_FUNCTIONS[mangleCSymbolName(dep)] = 0;
           }
         });
       }
@@ -329,7 +330,7 @@ function JSify(data, functionsOnly) {
     }
 
     itemsDict.functionStub.push(item);
-    var shortident = item.ident.substr(1);
+    var shortident = demangleCSymbolName(item.ident);
     // If this is not linkable, anything not in the library is definitely missing
     if (item.ident in DEAD_FUNCTIONS) {
       if (LibraryManager.library[shortident + '__asm']) {
@@ -420,14 +421,16 @@ function JSify(data, functionsOnly) {
         print('/* no memory initializer */'); // test purposes
       }
 
-      if (!SIDE_MODULE) {
+      if (!SIDE_MODULE && !WASM_BACKEND) {
         if (USE_PTHREADS) {
-          print('var tempDoublePtr;');
-          print('if (!ENVIRONMENT_IS_PTHREAD) tempDoublePtr = ' + makeStaticAlloc(12) + ';');
+          print('// Pthreads fill their tempDoublePtr memory area into the pthread stack when the thread is run.')
+          // Main thread still statically allocate tempDoublePtr - although it could theorerically also use its stack
+          // (that might allow removing the whole tempDoublePtr variable altogether from the codebase? but would need
+          // more refactoring)
+          print('var tempDoublePtr = ENVIRONMENT_IS_PTHREAD ? 0 : ' + makeStaticAlloc(8) + ';');
         } else {
-          print('var tempDoublePtr = ' + makeStaticAlloc(8) + '');
+          print('var tempDoublePtr = ' + makeStaticAlloc(8) + ';');
         }
-        if (ASSERTIONS) print('assert(tempDoublePtr % 8 == 0);');
         print('\nfunction copyTempFloat(ptr) { // functions, because inlining this code increases code size too much');
         print('  HEAP8[tempDoublePtr] = HEAP8[ptr];');
         print('  HEAP8[tempDoublePtr+1] = HEAP8[ptr+1];');
@@ -449,6 +452,21 @@ function JSify(data, functionsOnly) {
 
       return;
     }
+
+    var shellFile = SHELL_FILE ? SHELL_FILE : (SIDE_MODULE ? 'shell_sharedlib.js' : (MINIMAL_RUNTIME ? 'shell_minimal.js' : 'shell.js'));
+
+    var shellParts = read(shellFile).split('{{BODY}}');
+    print(processMacros(preprocess(shellParts[0], shellFile)));
+    var pre;
+    if (SIDE_MODULE) {
+      pre = processMacros(preprocess(read('preamble_sharedlib.js'), 'preamble_sharedlib.js'));
+    } else if (MINIMAL_RUNTIME) {
+      pre = processMacros(preprocess(read('preamble_minimal.js'), 'preamble_minimal.js'));
+    } else {
+      pre = processMacros(preprocess(read('support.js'), 'support.js')) +
+            processMacros(preprocess(read('preamble.js'), 'preamble.js'));
+    }
+    print(pre);
 
     // Print out global variables and postsets TODO: batching
     var legalizedI64sDefault = legalizedI64s;
@@ -544,10 +562,5 @@ function JSify(data, functionsOnly) {
     data.functionStubs.forEach(functionStubHandler);
   }
 
-  //B.start('jsifier-fc');
   finalCombiner();
-  //B.stop('jsifier-fc');
-
-  dprint('framework', 'Big picture: Finishing JSifier, main pass=' + mainPass);
-  //B.stop('jsifier');
 }

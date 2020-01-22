@@ -4,7 +4,7 @@
 // found in the LICENSE file.
 
 var LibraryGLUT = {
-  $GLUT__deps: ['$Browser'],
+  $GLUT__deps: ['$Browser', 'glutPostRedisplay'],
   $GLUT: {
     initTime: null,
     idleFunc: null,
@@ -129,7 +129,7 @@ var LibraryGLUT = {
       if (65 <= keycode && keycode <= 90)
         return event['shiftKey'] ? keycode : keycode + 32;
       if (96 <= keycode && keycode <= 105)
-        return keycode - 48; // numpad numbers    
+        return keycode - 48; // numpad numbers
       if (106 <= keycode && keycode <= 111)
         return keycode - 106 + 42; // *,+-./  TODO handle shift?
 
@@ -220,9 +220,9 @@ var LibraryGLUT = {
       }
 
       var simulatedEvent = document.createEvent("MouseEvent");
-      simulatedEvent.initMouseEvent(type, true, true, window, 1, 
-                                    main.screenX, main.screenY, 
-                                    main.clientX, main.clientY, false, 
+      simulatedEvent.initMouseEvent(type, true, true, window, 1,
+                                    main.screenX, main.screenY,
+                                    main.clientX, main.clientY, false,
                                     false, false, false, 0/*main*/, null);
 
       main.target.dispatchEvent(simulatedEvent);
@@ -301,35 +301,6 @@ var LibraryGLUT = {
         {{{ makeDynCall('vii') }}}(GLUT.reshapeFunc, width, height);
       }
       _glutPostRedisplay();
-    },
-
-    requestFullscreen: function() {
-      Browser.requestFullscreen(/*lockPointer=*/false, /*resizeCanvas=*/false);
-    },
-
-    requestFullScreen: function() {
-      err('GLUT.requestFullScreen() is deprecated. Please call GLUT.requestFullscreen instead.');
-      GLUT.requestFullScreen = function() {
-        return GLUT.requestFullscreen();
-      }
-      return GLUT.requestFullscreen();
-    },
-
-    exitFullscreen: function() {
-      var CFS = document['exitFullscreen'] ||
-                document['cancelFullScreen'] ||
-                document['mozCancelFullScreen'] ||
-                document['webkitCancelFullScreen'] ||
-          (function() {});
-      CFS.apply(document, []);
-    },
-
-    cancelFullScreen: function() {
-      err('GLUT.cancelFullScreen() is deprecated. Please call GLUT.exitFullscreen instead.');
-      GLUT.cancelFullScreen = function() {
-        return GLUT.exitFullscreen();
-      }
-      return GLUT.exitFullscreen();
     }
   },
 
@@ -600,7 +571,7 @@ var LibraryGLUT = {
     }
     Module['canvas'].style.cursor = cursorStyle;
   },
-  
+
   glutCreateWindow__proxy: 'sync',
   glutCreateWindow__deps: ['$Browser'],
   glutCreateWindow__sig: 'ii',
@@ -631,7 +602,7 @@ var LibraryGLUT = {
   glutReshapeWindow__deps: ['$GLUT', 'glutPostRedisplay'],
   glutReshapeWindow__sig: 'vi',
   glutReshapeWindow: function(width, height) {
-    GLUT.exitFullscreen();
+    Browser.exitFullscreen();
     Browser.setCanvasSize(width, height, true); // N.B. GLUT.reshapeFunc is also registered as a canvas resize callback.
                                                 // Just call it once here.
     if (GLUT.reshapeFunc) {
@@ -644,7 +615,7 @@ var LibraryGLUT = {
   glutPositionWindow__deps: ['$GLUT', 'glutPostRedisplay'],
   glutPositionWindow__sig: 'vii',
   glutPositionWindow: function(x, y) {
-    GLUT.exitFullscreen();
+    Browser.exitFullscreen();
     /* TODO */
     _glutPostRedisplay();
   },
@@ -660,7 +631,7 @@ var LibraryGLUT = {
     document.addEventListener('fullscreenchange', GLUT.onFullscreenEventChange, true);
     document.addEventListener('mozfullscreenchange', GLUT.onFullscreenEventChange, true);
     document.addEventListener('webkitfullscreenchange', GLUT.onFullscreenEventChange, true);
-    GLUT.requestFullscreen();
+    Browser.requestFullscreen(/*lockPointer=*/false, /*resizeCanvas=*/false);
   },
 
   glutInitDisplayMode__proxy: 'sync',
@@ -693,11 +664,10 @@ var LibraryGLUT = {
   glutMainLoop: function() {
     _glutReshapeWindow(Module['canvas'].width, Module['canvas'].height);
     _glutPostRedisplay();
-    throw 'SimulateInfiniteLoop';
+    throw 'unwind';
   },
 
 };
 
 autoAddDeps(LibraryGLUT, '$GLUT');
 mergeInto(LibraryManager.library, LibraryGLUT);
-

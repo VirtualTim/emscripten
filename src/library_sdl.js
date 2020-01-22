@@ -1052,10 +1052,8 @@ var LibrarySDL = {
 #if ASSERTIONS
       assert(tempCtx, 'TTF_Init must have been called');
 #endif
-      tempCtx.save();
       tempCtx.font = fontString;
       var ret = tempCtx.measureText(text).width | 0;
-      tempCtx.restore();
       return ret;
     },
 
@@ -1718,9 +1716,9 @@ var LibrarySDL = {
     // We actually do the whole screen in Unlock...
   },
 
-#if EMTERPRETIFY_ASYNC == 0
+#if EMTERPRETIFY_ASYNC == 0 && !(WASM_BACKEND && ASYNCIFY)
   SDL_Delay: function(delay) {
-    if (!ENVIRONMENT_IS_WORKER) abort('SDL_Delay called on the main thread! Potential infinite loop, quitting.');
+    if (!ENVIRONMENT_IS_WORKER) abort('SDL_Delay called on the main thread! Potential infinite loop, quitting. (consider building with async support like ASYNCIFY)');
     // horrible busy-wait, but in a worker it at least does not block rendering
     var now = Date.now();
     while (Date.now() - now < delay) {}
@@ -1735,8 +1733,8 @@ var LibrarySDL = {
   SDL_WM_SetCaption__proxy: 'sync',
   SDL_WM_SetCaption__sig: 'vii',
   SDL_WM_SetCaption: function(title, icon) {
-    if (title && typeof Module['setWindowTitle'] !== 'undefined') {
-      Module['setWindowTitle'](UTF8ToString(title));
+    if (title && typeof setWindowTitle !== 'undefined') {
+      setWindowTitle(UTF8ToString(title));
     }
     icon = icon && UTF8ToString(icon);
   },
@@ -2208,8 +2206,7 @@ var LibrarySDL = {
   SDL_WM_ToggleFullScreen__proxy: 'sync',
   SDL_WM_ToggleFullScreen__sig: 'ii',
   SDL_WM_ToggleFullScreen: function(surf) {
-    if (Browser.isFullscreen) {
-      Module['canvas'].exitFullscreen();
+    if (Browser.exitFullscreen()) {
       return 1;
     } else {
       if (!SDL.canRequestFullscreen) {
@@ -2226,7 +2223,7 @@ var LibrarySDL = {
     return flags; // We support JPG, PNG, TIF because browsers do
   },
 
-  IMG_Load_RW__deps: ['SDL_LockSurface', 'SDL_FreeRW'],
+  IMG_Load_RW__deps: ['SDL_LockSurface', 'SDL_FreeRW', '$PATH_FS'],
   IMG_Load_RW__proxy: 'sync',
   IMG_Load_RW__sig: 'iii',
   IMG_Load_RW: function(rwopsID, freeSrc) {
@@ -2243,9 +2240,9 @@ var LibrarySDL = {
         }
       }
       var callStbImage = function(func, params) {
-        var x = Module['_malloc']({{{ QUANTUM_SIZE }}});
-        var y = Module['_malloc']({{{ QUANTUM_SIZE }}});
-        var comp = Module['_malloc']({{{ QUANTUM_SIZE }}});
+        var x = Module['_malloc']({{{ Runtime.QUANTUM_SIZE }}});
+        var y = Module['_malloc']({{{ Runtime.QUANTUM_SIZE }}});
+        var comp = Module['_malloc']({{{ Runtime.QUANTUM_SIZE }}});
         addCleanup(function() {
           Module['_free'](x);
           Module['_free'](y);
@@ -2281,7 +2278,7 @@ var LibrarySDL = {
       }
 
       if (!raw) {
-        filename = PATH.resolve(filename);
+        filename = PATH_FS.resolve(filename);
         var raw = Module["preloadedImages"][filename];
         if (!raw) {
           if (raw === null) err('Trying to reuse preloaded image, but freePreloadedMediaOnUse is set!');
@@ -2489,12 +2486,25 @@ var LibrarySDL = {
         }
       }
 
-#if EMTERPRETIFY_ASYNC
-      var yieldCallback = function() {
+#if EMTERPRETIFY_ASYNC || (ASYNCIFY && WASM_BACKEND)
+      var sleepCallback = function() {
         if (SDL.audio && SDL.audio.queueNewAudioData) SDL.audio.queueNewAudioData();
       };
-      SDL.audio.yieldCallback = yieldCallback;
-      EmterpreterAsync.yieldCallbacks.push(yieldCallback);
+#if EMTERPRETIFY_ASYNC
+      EmterpreterAsync.yieldCallbacks.push(sleepCallback);
+      SDL.audio.callbackRemover = function() {
+        EmterpreterAsync.yieldCallbacks = EmterpreterAsync.yieldCallbacks.filter(function(callback) {
+          return callback !== sleepCallback;
+        });
+      }
+#else
+      Asyncify.sleepCallbacks.push(sleepCallback);
+      SDL.audio.callbackRemover = function() {
+        Asyncify.sleepCallbacks = Asyncify.sleepCallbacks.filter(function(callback) {
+          return callback !== sleepCallback;
+        });
+      }
+#endif
 #endif
 
       // Create a callback function that will be routinely called to ask more audio data from the user application.
@@ -2638,11 +2648,10 @@ var LibrarySDL = {
   SDL_CloseAudio__sig: 'v',
   SDL_CloseAudio: function() {
     if (SDL.audio) {
-#if EMTERPRETIFY_ASYNC
-      EmterpreterAsync.yieldCallbacks = EmterpreterAsync.yieldCallbacks.filter(function(callback) {
-        return callback !== SDL.audio.yieldCallback;
-      });
-#endif
+      if (SDL.audio.callbackRemover) {
+        SDL.audio.callbackRemover();
+        SDL.audio.callbackRemover = null;
+      }
       _SDL_PauseAudio(1);
       _free(SDL.audio.buffer);
       SDL.audio = null;
@@ -2740,6 +2749,7 @@ var LibrarySDL = {
     return 1;
   },
 
+  Mix_LoadWAV_RW__deps: ['$PATH_FS'],
   Mix_LoadWAV_RW__proxy: 'sync',
   Mix_LoadWAV_RW__sig: 'iii',
   Mix_LoadWAV_RW: function(rwopsID, freesrc) {
@@ -2775,7 +2785,7 @@ var LibrarySDL = {
     var bytes;
 
     if (rwops.filename !== undefined) {
-      filename = PATH.resolve(rwops.filename);
+      filename = PATH_FS.resolve(rwops.filename);
       var raw = Module["preloadedAudios"][filename];
       if (!raw) {
         if (raw === null) err('Trying to reuse preloaded audio, but freePreloadedMediaOnUse is set!');
@@ -2818,13 +2828,12 @@ var LibrarySDL = {
       // after loading. Therefore prepare an array of callback handlers to run when this audio decoding is complete, which
       // will then start the playback (with some delay).
       webAudio.onDecodeComplete = []; // While this member array exists, decoding hasn't finished yet.
-      function onDecodeComplete(data) {
+      var onDecodeComplete = function(data) {
         webAudio.decodedBuffer = data;
         // Call all handlers that were waiting for this decode to finish, and clear the handler list.
         webAudio.onDecodeComplete.forEach(function(e) { e(); });
         webAudio.onDecodeComplete = undefined; // Don't allow more callback handlers since audio has finished decoding.
-      }
-
+      };
       SDL.audioContext['decodeAudioData'](arrayBuffer, onDecodeComplete);
     } else if (audio === undefined && bytes) {
       // Here, we didn't find a preloaded audio but we either were passed a filepath for
@@ -3158,8 +3167,16 @@ var LibrarySDL = {
   TTF_Init__proxy: 'sync',
   TTF_Init__sig: 'i',
   TTF_Init: function() {
-    var canvas = document.createElement('canvas');
-    SDL.ttfContext = canvas.getContext('2d');
+    // OffscreenCanvas 2D is faster than Canvas for text operations, so we use
+    // it if it's available.
+    try {
+      var offscreenCanvas = new OffscreenCanvas(0, 0);
+      SDL.ttfContext = offscreenCanvas.getContext('2d');
+    } catch (ex) {
+      var canvas = document.createElement('canvas');
+      SDL.ttfContext = canvas.getContext('2d');
+    }
+
     return 0;
   },
 
@@ -3196,7 +3213,7 @@ var LibrarySDL = {
     surfData.ctx.save();
     surfData.ctx.fillStyle = color;
     surfData.ctx.font = fontString;
-    // use bottom alligment, because it works
+    // use bottom alignment, because it works
     // same in all browsers, more info here:
     // https://bugzilla.mozilla.org/show_bug.cgi?id=737852
     surfData.ctx.textBaseline = 'bottom';

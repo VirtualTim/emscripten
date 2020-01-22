@@ -65,10 +65,6 @@ var ensureFloat64;
  */
 var VoidPtr;
 
-// Various Emscripten-specific global variables
-var tempI64;
-var tempDouble;
-
 /**
  * GL functions (https://github.com/emscripten-core/emscripten/commit/97a464a654fdadf5dfb8aa082b48516e6bf8d402#commitcomment-25520648)
  */
@@ -201,8 +197,6 @@ var _glGetTexEnviv;
  * @suppress {duplicate, undefinedVars}
  */
 var _glGetTexEnvfv;
-
-var _glutPostRedisplay = function() {};
 
 /**
  * @suppress {undefinedVars}

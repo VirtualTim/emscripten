@@ -6,8 +6,10 @@
 mergeInto(LibraryManager.library, {
   $TTY__deps: ['$FS'],
 #if !MINIMAL_RUNTIME
-  $TTY__postset: '__ATINIT__.unshift(function() { TTY.init() });' +
-                 '__ATEXIT__.push(function() { TTY.shutdown() });',
+  $TTY__postset: function() {
+    addAtInit('TTY.init();');
+    addAtExit('TTY.shutdown();');
+  },
 #endif
   $TTY: {
     ttys: [],
@@ -40,7 +42,7 @@ mergeInto(LibraryManager.library, {
       open: function(stream) {
         var tty = TTY.ttys[stream.node.rdev];
         if (!tty) {
-          throw new FS.ErrnoError(ERRNO_CODES.ENODEV);
+          throw new FS.ErrnoError({{{ cDefine('ENODEV') }}});
         }
         stream.tty = tty;
         stream.seekable = false;
@@ -54,7 +56,7 @@ mergeInto(LibraryManager.library, {
       },
       read: function(stream, buffer, offset, length, pos /* ignored */) {
         if (!stream.tty || !stream.tty.ops.get_char) {
-          throw new FS.ErrnoError(ERRNO_CODES.ENXIO);
+          throw new FS.ErrnoError({{{ cDefine('ENXIO') }}});
         }
         var bytesRead = 0;
         for (var i = 0; i < length; i++) {
@@ -62,10 +64,10 @@ mergeInto(LibraryManager.library, {
           try {
             result = stream.tty.ops.get_char(stream.tty);
           } catch (e) {
-            throw new FS.ErrnoError(ERRNO_CODES.EIO);
+            throw new FS.ErrnoError({{{ cDefine('EIO') }}});
           }
           if (result === undefined && bytesRead === 0) {
-            throw new FS.ErrnoError(ERRNO_CODES.EAGAIN);
+            throw new FS.ErrnoError({{{ cDefine('EAGAIN') }}});
           }
           if (result === null || result === undefined) break;
           bytesRead++;
@@ -78,14 +80,14 @@ mergeInto(LibraryManager.library, {
       },
       write: function(stream, buffer, offset, length, pos) {
         if (!stream.tty || !stream.tty.ops.put_char) {
-          throw new FS.ErrnoError(ERRNO_CODES.ENXIO);
+          throw new FS.ErrnoError({{{ cDefine('ENXIO') }}});
         }
         try {
           for (var i = 0; i < length; i++) {
             stream.tty.ops.put_char(stream.tty, buffer[offset+i]);
           }
         } catch (e) {
-          throw new FS.ErrnoError(ERRNO_CODES.EIO);
+          throw new FS.ErrnoError({{{ cDefine('EIO') }}});
         }
         if (length) {
           stream.node.timestamp = Date.now();
@@ -105,23 +107,11 @@ mergeInto(LibraryManager.library, {
           if (ENVIRONMENT_IS_NODE) {
             // we will read data by chunks of BUFSIZE
             var BUFSIZE = 256;
-            var buf = new Buffer(BUFSIZE);
+            var buf = Buffer.alloc ? Buffer.alloc(BUFSIZE) : new Buffer(BUFSIZE);
             var bytesRead = 0;
 
-            var isPosixPlatform = (process.platform != 'win32'); // Node doesn't offer a direct check, so test by exclusion
-
-            var fd = process.stdin.fd;
-            if (isPosixPlatform) {
-              // Linux and Mac cannot use process.stdin.fd (which isn't set up as sync)
-              var usingDevice = false;
-              try {
-                fd = fs.openSync('/dev/stdin', 'r');
-                usingDevice = true;
-              } catch (e) {}
-            }
-
             try {
-              bytesRead = fs.readSync(fd, buf, 0, BUFSIZE, null);
+              bytesRead = nodeFS.readSync(process.stdin.fd, buf, 0, BUFSIZE, null);
             } catch(e) {
               // Cross-platform differences: on Windows, reading EOF throws an exception, but on other OSes,
               // reading EOF returns 0. Uniformize behavior by treating the EOF exception to return 0.
@@ -129,7 +119,6 @@ mergeInto(LibraryManager.library, {
               else throw e;
             }
 
-            if (usingDevice) { fs.closeSync(fd); }
             if (bytesRead > 0) {
               result = buf.slice(0, bytesRead).toString('utf-8');
             } else {

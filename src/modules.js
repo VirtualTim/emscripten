@@ -29,8 +29,6 @@ var Types = {
   types: {},
 };
 
-var firstTableIndex = RESERVED_FUNCTION_POINTERS + 1;
-
 // Constructs an array ['a0', 'a1', 'a2', ..., 'a(n-1)']
 function genArgSequence(n) {
   var args = [];
@@ -43,60 +41,8 @@ function genArgSequence(n) {
 var Functions = {
   // All functions that will be implemented in this file. Maps id to signature
   implementedFunctions: {},
-  libraryFunctions: {}, // functions added from the library. value 2 means asmLibraryFunction
-  unimplementedFunctions: {}, // library etc. functions that we need to index, maps id to signature
-
-  nextIndex: firstTableIndex, // Start at a non-0 (even, see below) value
-  neededTables: set('v', 'vi', 'ii', 'iii'), // signatures that appeared (initialized with library stuff
-                                             // we always use), and we will need a function table for
-
-  blockAddresses: {}, // maps functions to a map of block labels to label ids
-
-  aliases: {}, // in shared modules (MAIN_MODULE or SHARED_MODULE), a list of aliases for functions that have them
-
-  getSignatureLetter: function(type) {
-    switch(type) {
-      case 'float': return 'f';
-      case 'double': return 'd';
-      case 'void': return 'v';
-      default: return 'i';
-    }
-  },
-
-  getSignatureType: function(letter) {
-    switch(letter) {
-      case 'v': return 'void';
-      case 'i': return 'i32';
-      case 'f': return 'float';
-      case 'd': return 'double';
-      default: throw 'what is this sig? ' + sig;
-    }
-  },
-
-  getSignature: function(returnType, argTypes, hasVarArgs) {
-    var sig = Functions.getSignatureLetter(returnType);
-    for (var i = 0; i < argTypes.length; i++) {
-      var type = argTypes[i];
-      if (!type) break; // varargs
-      if (type in Compiletime.FLOAT_TYPES) {
-        sig += Functions.getSignatureLetter(type);
-      } else {
-        var chunks = getNumIntChunks(type);
-        if (chunks > 0) {
-          for (var j = 0; j < chunks; j++) sig += 'i';
-        } else if (type !== '...') {
-          // some special type like a SIMD vector (anything but varargs, which we handle below)
-          sig += Functions.getSignatureLetter(type);
-        }
-      }
-    }
-    if (hasVarArgs) sig += 'i';
-    return sig;
-  },
-
-  getTable: function(sig) {
-    return 'FUNCTION_TABLE_' + sig
-  }
+  // functions added from the library. value 2 means asmLibraryFunction
+  libraryFunctions: {},
 };
 
 var LibraryManager = {
@@ -119,8 +65,16 @@ var LibraryManager = {
       'library_path.js',
       'library_signals.js',
       'library_syscall.js',
-      'library_html5.js'
+      'library_html5.js',
+      'library_stack_trace.js',
+      'library_wasi.js'
     ];
+
+    if (!DISABLE_EXCEPTION_THROWING) {
+      libraries.push('library_exceptions.js');
+    } else {
+      libraries.push('library_exceptions_stub.js');
+    }
 
     if (!MINIMAL_RUNTIME) {
       libraries.push('library_browser.js');
@@ -132,62 +86,55 @@ var LibraryManager = {
         'library_fs.js',
         'library_memfs.js',
         'library_tty.js',
-        'library_pipefs.js',
+        'library_pipefs.js', // ok to include it by default since it's only used if the syscall is used
+        'library_sockfs.js', // ok to include it by default since it's only used if the syscall is used
       ]);
 
-      // Additional filesystem libraries (in strict mode, link to these explicitly via -lxxx.js)
-      if (!STRICT) {
-        libraries = libraries.concat([
-          'library_lz4.js',
-        ]);
-        if (ENVIRONMENT_MAY_BE_WEB) {
-          libraries = libraries.concat([
-            'library_idbfs.js',
-            'library_proxyfs.js',
-            'library_sockfs.js',
-            'library_workerfs.js',
-          ]);
+      if (NODERAWFS) {
+        // NODERAWFS requires NODEFS
+        if (SYSTEM_JS_LIBRARIES.indexOf('library_nodefs.js') < 0) {
+          libraries.push('library_nodefs.js');
         }
-        if (ENVIRONMENT_MAY_BE_NODE) {
-          libraries = libraries.concat([
-            'library_nodefs.js',
-          ]);
-        }
-        if (NODERAWFS) {
-          libraries.push('library_noderawfs.js')
-        }
+        libraries.push('library_noderawfs.js');
       }
     }
 
-    // Additional JS libraries (in strict mode, link to these explicitly via -lxxx.js)
-    if (!STRICT) {
+    // Additional JS libraries (without AUTO_JS_LIBRARIES, link to these explicitly via -lxxx.js)
+    if (AUTO_JS_LIBRARIES) {
       libraries = libraries.concat([
         'library_webgl.js',
         'library_openal.js',
-        'library_vr.js'
+        'library_vr.js',
+        'library_sdl.js',
+        'library_glut.js',
+        'library_xlib.js',
+        'library_egl.js',
+        'library_glfw.js',
+        'library_uuid.js',
+        'library_glew.js',
+        'library_idbstore.js',
+        'library_async.js'
       ]);
-
-      if (!MINIMAL_RUNTIME) {
-        libraries = libraries.concat([
-          'library_sdl.js',
-          'library_glut.js',
-          'library_xlib.js',
-          'library_egl.js',
-          'library_glfw.js',
-          'library_uuid.js',
-          'library_glew.js',
-          'library_idbstore.js',
-          'library_async.js'
-        ]);
+    } else {
+      if (EMTERPRETIFY_ASYNC || ASYNCIFY) {
+        libraries.push('library_async.js');
+      }
+      if (USE_SDL == 1) {
+        libraries.push('library_sdl.js');
+      }
+      if (USE_SDL == 2) {
+        libraries.push('library_egl.js', 'library_webgl.js');
       }
     }
 
-    // If there are any explicitly specified system JS libraries to link to, add those to link.
-    if (SYSTEM_JS_LIBRARIES) {
-      libraries = libraries.concat(SYSTEM_JS_LIBRARIES.split(','));
+    // Add any explicitly specified system JS libraries to link to, add those to link.
+    libraries = libraries.concat(SYSTEM_JS_LIBRARIES)
+
+    if (LZ4) {
+      libraries.push('library_lz4.js');
     }
 
-    if (USE_WEBGL2) {
+    if (MAX_WEBGL_VERSION >= 2) {
       libraries.push('library_webgl2.js');
     }
 
@@ -195,13 +142,9 @@ var LibraryManager = {
       libraries.push('library_glemu.js');
     }
 
-    libraries = libraries.concat(additionalLibraries);
-
     if (BOOTSTRAPPING_STRUCT_INFO) libraries = ['library_bootstrap_structInfo.js', 'library_formatString.js'];
-    if (ONLY_MY_CODE) {
-      libraries.length = 0;
-      LibraryManager.library = {};
-    }
+
+    // TODO: deduplicate libraries (not needed for correctness, but avoids unnecessary work)
 
     // Save the list for has() queries later.
     this.libraries = libraries;
@@ -214,11 +157,24 @@ var LibraryManager = {
         processed = processMacros(preprocess(src, filename));
         eval(processed);
       } catch(e) {
-        var details = [e, e.lineNumber ? 'line number: ' + e.lineNumber : '', (e.stack || "").toString().replace('Object.<anonymous>', filename)];
+        var details = [e, e.lineNumber ? 'line number: ' + e.lineNumber : ''];
+        if (VERBOSE) {
+          details.push((e.stack || "").toString().replace('Object.<anonymous>', filename));
+        }
         if (processed) {
-          error('failure to execute js library "' + filename + '": ' + details + '\npreprocessed source (you can run a js engine on this to get a clearer error message sometimes):\n=============\n' + processed + '\n=============\n');
+          error('failure to execute js library "' + filename + '": ' + details);
+          if (VERBOSE) {
+            error('preprocessed source (you can run a js engine on this to get a clearer error message sometimes):\n=============\n' + processed + '\n=============');
+          } else {
+            error('use -s VERBOSE to see more details')
+          }
         } else {
-          error('failure to process js library "' + filename + '": ' + details + '\noriginal source:\n=============\n' + src + '\n=============\n');
+          error('failure to process js library "' + filename + '": ' + details);
+          if (VERBOSE) {
+            error('original source:\n=============\n' + src + '\n=============');
+          } else {
+            error('use -s VERBOSE to see more details')
+          }
         }
         throw e;
       }
@@ -233,8 +189,8 @@ var LibraryManager = {
       if (typeof lib[x] === 'string') {
         var target = x;
         while (typeof lib[target] === 'string') {
-          // ignore code, aliases are just simple names
-          if (lib[target].search(/[({; ]/) >= 0) continue libloop;
+          // ignore code and variable assignments, aliases are just simple names
+          if (lib[target].search(/[=({; ]/) >= 0) continue libloop;
           // ignore trivial pass-throughs to Math.*
           if (lib[target].indexOf('Math_') == 0) continue libloop;
           target = lib[target];
@@ -315,7 +271,7 @@ var LibraryManager = {
   }
 };
 
-if (!BOOTSTRAPPING_STRUCT_INFO && !ONLY_MY_CODE) {
+if (!BOOTSTRAPPING_STRUCT_INFO) {
   // Load struct and define information.
   var temp = JSON.parse(read(STRUCT_INFO));
   C_STRUCTS = temp.structs;
@@ -351,7 +307,8 @@ function isExportedByForceFilesystem(name) {
          name === 'FS_unlink' ||
          name === 'getMemory' ||
          name === 'addRunDependency' ||
-         name === 'removeRunDependency';
+         name === 'removeRunDependency' ||
+         name === 'calledRun';
 }
 
 // export parts of the JS runtime that the user asked for
@@ -387,9 +344,9 @@ function exportRuntime() {
         extra = '. Alternatively, forcing filesystem support (-s FORCE_FILESYSTEM=1) can export this for you';
       }
       if (!isNumber) {
-        return 'if (!Module["' + name + '"]) Module["' + name + '"] = function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") };';
+        return 'if (!Object.getOwnPropertyDescriptor(Module, "' + name + '")) Module["' + name + '"] = function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") };';
       } else {
-        return 'if (!Module["' + name + '"]) Object.defineProperty(Module, "' + name + '", { get: function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") } });';
+        return 'if (!Object.getOwnPropertyDescriptor(Module, "' + name + '")) Object.defineProperty(Module, "' + name + '", { configurable: true, get: function() { abort("\'' + name + '\' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)' + extra + '") } });';
       }
     }
     return '';
@@ -446,7 +403,6 @@ function exportRuntime() {
     'FS_unlink',
     'GL',
     'dynamicAlloc',
-    'warnOnce',
     'loadDynamicLibrary',
     'loadWebAssemblyModule',
     'getLEB',
@@ -460,31 +416,45 @@ function exportRuntime() {
     'makeBigInt',
     'dynCall',
     'getCompilerSetting',
-    'stackSave',
-    'stackRestore',
-    'stackAlloc',
-    'establishStackSpace',
     'print',
     'printErr',
     'getTempRet0',
     'setTempRet0',
+    'callMain',
+    'abort',
   ];
 
   if (!MINIMAL_RUNTIME) {
-    runtimeElements.push('Pointer_stringify');
+    runtimeElements.push('warnOnce');
+    runtimeElements.push('stackSave');
+    runtimeElements.push('stackRestore');
+    runtimeElements.push('stackAlloc');
+    if (USE_PTHREADS) {
+      runtimeElements.push('establishStackSpace');
+    }
   }
 
-  if (MODULARIZE) {
-    // In MODULARIZE=1 mode, the following functions need to be exported out to Module for worker.js to access.
-    if (STACK_OVERFLOW_CHECK) {
-      runtimeElements.push('writeStackCookie');
-      runtimeElements.push('checkStackCookie');
+  if (STACK_OVERFLOW_CHECK) {
+    runtimeElements.push('writeStackCookie');
+    runtimeElements.push('checkStackCookie');
+    if (!MINIMAL_RUNTIME) {
       runtimeElements.push('abortStackOverflow');
     }
-    if (USE_PTHREADS) {
-      runtimeElements.push('PThread');
-      runtimeElements.push('ExitStatus');
+  }
+
+  if (USE_PTHREADS) {
+    // In pthreads mode, the following functions always need to be exported to
+    // Module for closure compiler, and also for MODULARIZE (so worker.js can
+    // access them).
+    var threadExports = ['PThread', 'ExitStatus', '_pthread_self'];
+    if (WASM) {
+      threadExports.push('wasmMemory');
     }
+
+    threadExports.forEach(function(x) {
+      EXPORTED_RUNTIME_METHODS_SET[x] = 1;
+      runtimeElements.push(x);
+    });
   }
 
   if (SUPPORT_BASE64_EMBEDDING) {
@@ -505,6 +475,7 @@ function exportRuntime() {
     'ALLOC_STACK',
     'ALLOC_DYNAMIC',
     'ALLOC_NONE',
+    'calledRun',
   ];
   if (ASSERTIONS) {
     // check all exported things exist, warn about typos
@@ -527,7 +498,11 @@ var PassManager = {
     print('\n//FORWARDED_DATA:' + JSON.stringify({
       Functions: Functions,
       EXPORTED_FUNCTIONS: EXPORTED_FUNCTIONS,
-      STATIC_BUMP: STATIC_BUMP // updated with info from JS
+      STATIC_BUMP: STATIC_BUMP, // updated with info from JS
+      DYNAMICTOP_PTR: DYNAMICTOP_PTR,
+      ATINITS: ATINITS.join('\n'),
+      ATMAINS: ATMAINS.join('\n'),
+      ATEXITS: ATEXITS.join('\n'),
     }));
   },
   load: function(json) {

@@ -1,18 +1,13 @@
 
 #if !MINIMAL_RUNTIME // TODO: Reintroduce these to MINIMAL_RUNTIME as library functions
 
-/** @type {function(number, number=)} */
-function Pointer_stringify(ptr, length) {
-  abort("this function has been removed - you should use UTF8ToString(ptr, maxBytesToRead) instead!");
-}
-
 // Given a pointer 'ptr' to a null-terminated ASCII-encoded string in the emscripten HEAP, returns
 // a copy of that string as a Javascript String object.
 
 function AsciiToString(ptr) {
   var str = '';
   while (1) {
-    var ch = {{{ makeGetValue('ptr++', 0, 'i8') }}};
+    var ch = {{{ makeGetValue('ptr++', 0, 'i8', null, true) }}};
     if (!ch) return str;
     str += String.fromCharCode(ch);
   }
@@ -102,8 +97,8 @@ function UTF8ArrayToString(u8Array, idx, maxBytesToRead) {
     }
 #if TEXTDECODER
   }
-  return str;
 #endif // TEXTDECODER
+  return str;
 #endif // TEXTDECODER == 2
 }
 

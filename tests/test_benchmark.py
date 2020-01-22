@@ -16,7 +16,7 @@ import zlib
 if __name__ == '__main__':
   raise Exception('do not run this file directly; do something like: tests/runner.py benchmark')
 
-from runner import RunnerCore, chdir, get_poppler_library
+from runner import RunnerCore, chdir
 from tools.shared import run_process, path_from_root, CLANG, Building, SPIDERMONKEY_ENGINE, LLVM_ROOT, CLOSURE_COMPILER, CLANG_CC, V8_ENGINE, PIPE, try_delete, PYTHON, EMCC
 from tools import shared, jsrun
 
@@ -29,7 +29,7 @@ from tools import shared, jsrun
 # 5: 10 seconds
 DEFAULT_ARG = '4'
 
-TEST_REPS = 3
+TEST_REPS = 5
 
 # by default, run just core benchmarks
 CORE_BENCHMARKS = True
@@ -45,17 +45,22 @@ OPTIMIZATIONS = '-O3'
 
 PROFILING = 0
 
+LLVM_FEATURE_FLAGS = ['-mnontrapping-fptoint']
+
 
 class Benchmarker(object):
   def __init__(self, name):
     self.name = name
 
-  def bench(self, args, output_parser=None, reps=TEST_REPS):
+  def bench(self, args, output_parser=None, reps=TEST_REPS, expected_output=None):
     self.times = []
     self.reps = reps
     for i in range(reps):
       start = time.time()
       output = self.run(args)
+      if expected_output is not None and expected_output not in output:
+        raise ValueError('Incorrect benchmark output:\n' + output)
+
       if not output_parser or args == ['0']: # if arg is 0, we are not running code, and have no output to parse
         if IGNORE_COMPILATION:
           curr = float(re.search(r'took +([\d\.]+) milliseconds', output).group(1)) / 1000
@@ -72,24 +77,29 @@ class Benchmarker(object):
   def display(self, baseline=None):
     # speed
 
-    if baseline == self:
-      baseline = None
-    mean = sum(self.times) / len(self.times)
-    squared_times = [x * x for x in self.times]
-    mean_of_squared = sum(squared_times) / len(self.times)
-    std = math.sqrt(mean_of_squared - mean * mean)
-    sorted_times = self.times[:]
-    sorted_times.sort()
-    median = sum(sorted_times[len(sorted_times) // 2 - 1:len(sorted_times) // 2 + 1]) / 2
+    if self.times:
+      if baseline == self:
+        baseline = None
+      mean = sum(self.times) / len(self.times)
+      squared_times = [x * x for x in self.times]
+      mean_of_squared = sum(squared_times) / len(self.times)
+      std = math.sqrt(mean_of_squared - mean * mean)
+      sorted_times = self.times[:]
+      sorted_times.sort()
+      count = len(sorted_times)
+      if count % 2 == 0:
+        median = sum(sorted_times[count // 2 - 1:count // 2 + 1]) / 2
+      else:
+        median = sorted_times[count // 2]
 
-    print('   %10s: mean: %4.3f (+-%4.3f) secs  median: %4.3f  range: %4.3f-%4.3f  (noise: %4.3f%%)  (%d runs)' % (self.name, mean, std, median, min(self.times), max(self.times), 100 * std / mean, self.reps), end=' ')
+      print('   %10s: mean: %4.3f (+-%4.3f) secs  median: %4.3f  range: %4.3f-%4.3f  (noise: %4.3f%%)  (%d runs)' % (self.name, mean, std, median, min(self.times), max(self.times), 100 * std / mean, self.reps), end=' ')
 
-    if baseline:
-      mean_baseline = sum(baseline.times) / len(baseline.times)
-      final = mean / mean_baseline
-      print('  Relative: %.2f X slower' % final)
-    else:
-      print()
+      if baseline:
+        mean_baseline = sum(baseline.times) / len(baseline.times)
+        final = mean / mean_baseline
+        print('  Relative: %.2f X slower' % final)
+      else:
+        print()
 
     # size
 
@@ -115,7 +125,9 @@ class NativeBenchmarker(Benchmarker):
   def build(self, parent, filename, args, shared_args, emcc_args, native_args, native_exec, lib_builder, has_output_parser):
     self.parent = parent
     if lib_builder:
-      native_args += lib_builder(self.name, native=True, env_init={'CC': self.cc, 'CXX': self.cxx, 'CXXFLAGS': "-Wno-c++11-narrowing"})
+      env = {'CC': self.cc, 'CXX': self.cxx, 'CXXFLAGS': "-Wno-c++11-narrowing"}
+      env.update(shared.get_clang_native_env())
+      native_args += lib_builder(self.name, native=True, env_init=env)
     if not native_exec:
       compiler = self.cxx if filename.endswith('cpp') else self.cc
       cmd = [
@@ -124,10 +136,8 @@ class NativeBenchmarker(Benchmarker):
         filename,
         '-o', filename + '.native'
       ] + self.args + shared_args + native_args + shared.get_clang_native_args()
-      proc = run_process(cmd, stdout=PIPE, stderr=parent.stderr_redirect, env=shared.get_clang_native_env())
-      if proc.returncode != 0:
-        print("Building native executable with command failed", ' '.join(cmd), file=sys.stderr)
-        print("Output: " + str(proc.stdout) + '\n' + str(proc.stderr))
+      # print(cmd)
+      run_process(cmd, env=shared.get_clang_native_env())
     else:
       shutil.copyfile(native_exec, filename + '.native')
       shutil.copymode(native_exec, filename + '.native')
@@ -174,46 +184,40 @@ class EmscriptenBenchmarker(Benchmarker):
     llvm_root = self.env.get('LLVM') or LLVM_ROOT
     if lib_builder:
       emcc_args = emcc_args + lib_builder('js_' + llvm_root, native=False, env_init=self.env.copy())
-    open('hardcode.py', 'w').write('''
-def process(filename):
-  js = open(filename).read()
-  replaced = js.replace("run();", "run(%s.concat(Module[\\"arguments\\"]));")
-  assert js != replaced
-  open(filename, 'w').write(replaced)
-import sys
-process(sys.argv[1])
-''' % str(args[:-1])) # do not hardcode in the last argument, the default arg
-
     final = os.path.dirname(filename) + os.path.sep + self.name + ('_' if self.name else '') + os.path.basename(filename) + '.js'
     final = final.replace('.cpp', '')
     try_delete(final)
     cmd = [
       PYTHON, EMCC, filename,
       OPTIMIZATIONS,
-      '--js-transform', 'python hardcode.py',
-      '-s', 'TOTAL_MEMORY=256*1024*1024',
+      '-s', 'TOTAL_MEMORY=256MB',
       '-s', 'FILESYSTEM=0',
       '--closure', '1',
+      '-s', 'MINIMAL_RUNTIME=0',
       '-s', 'BENCHMARK=%d' % (1 if IGNORE_COMPILATION and not has_output_parser else 0),
       '-o', final
-    ] + shared_args + emcc_args + self.extra_args
+    ] + shared_args + emcc_args + LLVM_FEATURE_FLAGS + self.extra_args
     if 'FORCE_FILESYSTEM=1' in cmd:
       cmd = [arg if arg != 'FILESYSTEM=0' else 'FILESYSTEM=1' for arg in cmd]
     if PROFILING:
       cmd += ['--profiling-funcs']
-    output = run_process(cmd, stdout=PIPE, stderr=PIPE, env=self.env).stdout
-    assert os.path.exists(final), 'Failed to compile file: ' + output + ' (looked for ' + final + ')'
+    self.cmd = cmd
+    run_process(cmd, env=self.env)
     if self.binaryen_opts:
       run_binaryen_opts(final[:-3] + '.wasm', self.binaryen_opts)
     self.filename = final
 
   def run(self, args):
-    return jsrun.run_js(self.filename, engine=self.engine, args=args, stderr=PIPE, full_output=True, assert_returncode=None)
+    return jsrun.run_js(self.filename, engine=self.engine, args=args, stderr=PIPE, full_output=True)
 
   def get_output_files(self):
     ret = [self.filename]
-    if 'WASM=0' in self.extra_args:
-      ret.append(self.filename + '.mem')
+    if 'WASM=0' in self.cmd:
+      if 'MINIMAL_RUNTIME=1' in self.cmd:
+        ret.append(self.filename[:-3] + '.asm.js')
+        ret.append(self.filename[:-3] + '.mem')
+      else:
+        ret.append(self.filename + '.mem')
     else:
       ret.append(self.filename[:-3] + '.wasm')
     return ret
@@ -240,39 +244,8 @@ class CheerpBenchmarker(Benchmarker):
     open(cheerp_temp, 'w').write('''
       %(code)s
 #include <cheerp/client.h>
-namespace client
-{
-    extern client::TArray<client::String>& args;
-}
-class [[cheerp::genericjs]] Arguments
-{
-public:
-    static int getArgumentsCount()
-    {
-        return client::args.get_length();
-    }
-    static int getArgumentLength(int arg)
-    {
-        return client::args[arg]->get_length();
-    }
-    static void copyArgument(int arg, char* buf)
-    {
-        client::String* a = client::args[arg];
-        for(int i=0;i<a->get_length();i++)
-            *(buf++) = a->charCodeAt(i);
-        *buf = 0;
-    }
-};
 void webMain() {
-    int arg1Len = Arguments::getArgumentLength(0);
-    char arg1Buf[arg1Len+1];
-    Arguments::copyArgument(0, arg1Buf);
-    const char* args[2];
-    args[0]="benchmark";
-    args[1]=arg1Buf;
-    int argc = Arguments::getArgumentsCount() + 1;
-    const char** argv=&args[0];
-    main(argc, ( char**)argv);
+  main();
 }\n''' % {
       'code': code,
     })
@@ -299,7 +272,8 @@ void webMain() {
         'CXXFLAGS': ' '.join(cheerp_args),
         'CHEERP_PREFIX': CHEERP_BIN + '../',
       })
-    # cheerp_args += ['-cheerp-pretty-code'] # get function names, like emcc --profiling
+    if PROFILING:
+      cheerp_args += ['-cheerp-pretty-code'] # get function names, like emcc --profiling
     final = os.path.dirname(filename) + os.path.sep + self.name + ('_' if self.name else '') + os.path.basename(filename) + '.js'
     final = final.replace('.cpp', '')
     try_delete(final)
@@ -319,11 +293,10 @@ void webMain() {
         '-o', final.replace('.js', '.wasm')
       ] + shared_args
       # print(' '.join(cmd))
-      run_process(cmd)
+      run_process(cmd, stdout=PIPE, stderr=PIPE)
       self.filename = final
       # Inject command line arguments
       run_process(['sed', '-i', 's/"use strict";/"use strict";var args=typeof(scriptArgs) !== "undefined" ? scriptArgs : arguments;/', self.filename])
-      Building.get_binaryen()
       if self.binaryen_opts:
         run_binaryen_opts(final.replace('.js', '.wasm'), self.binaryen_opts)
     finally:
@@ -341,62 +314,49 @@ void webMain() {
 
 
 # Benchmarkers
-try:
-  benchmarkers_error = ''
-  benchmarkers = [
-    NativeBenchmarker('clang', CLANG_CC, CLANG),
+
+benchmarkers = []
+
+if CLANG_CC and CLANG:
+  benchmarkers += [
+    # NativeBenchmarker('clang', CLANG_CC, CLANG),
     # NativeBenchmarker('gcc',   'gcc',    'g++')
   ]
-  if SPIDERMONKEY_ENGINE and SPIDERMONKEY_ENGINE in shared.JS_ENGINES:
-    benchmarkers += [
-      # EmscriptenBenchmarker('sm-asmjs', SPIDERMONKEY_ENGINE, ['-s', 'WASM=0']),
-      # EmscriptenBenchmarker('sm-asm2wasm',  SPIDERMONKEY_ENGINE + ['--no-wasm-baseline'], []),
-      # EmscriptenBenchmarker('v8-wasmbc',  V8_ENGINE, env={
-      #  'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
-      # }),
-      # EmscriptenBenchmarker('v8-wasmobj',  V8_ENGINE, ['-s', 'WASM_OBJECT_FILES=1'], env={
-      #  'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
-      # }),
-    ]
-  if V8_ENGINE and V8_ENGINE in shared.JS_ENGINES:
-    benchmarkers += [
-      EmscriptenBenchmarker('v8-asmjs', V8_ENGINE, ['-s', 'WASM=0']),
-      EmscriptenBenchmarker('v8-asm2wasm',  V8_ENGINE, env={
-       'LLVM': os.path.expanduser('~/Dev/fastcomp/build/bin'),
-      }),
-      EmscriptenBenchmarker('v8-wasmbc',  V8_ENGINE, env={
-       'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
-      }),
-      EmscriptenBenchmarker('v8-wasmobj',  V8_ENGINE, ['-s', 'WASM_OBJECT_FILES=1'], env={
-       'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
-      }),
-    ]
-  if os.path.exists(CHEERP_BIN):
-    benchmarkers += [
-      # CheerpBenchmarker('cheerp-sm-wasm', SPIDERMONKEY_ENGINE + ['--no-wasm-baseline']),
-      # CheerpBenchmarker('cheerp-v8-wasm', V8_ENGINE),
-    ]
-except Exception as e:
-  benchmarkers_error = str(e)
-  benchmarkers = []
+if SPIDERMONKEY_ENGINE and SPIDERMONKEY_ENGINE in shared.JS_ENGINES:
+  benchmarkers += [
+    # EmscriptenBenchmarker('sm', SPIDERMONKEY_ENGINE),
+  ]
+if V8_ENGINE and V8_ENGINE in shared.JS_ENGINES:
+  benchmarkers += [
+    EmscriptenBenchmarker(os.environ.get('EMBENCH_NAME') or 'v8', V8_ENGINE),
+  ]
+if shared.NODE_JS and shared.NODE_JS in shared.JS_ENGINES:
+  benchmarkers += [
+    EmscriptenBenchmarker('Node.js', shared.NODE_JS),
+  ]
+if os.path.exists(CHEERP_BIN):
+  benchmarkers += [
+    # CheerpBenchmarker('cheerp-sm-wasm', SPIDERMONKEY_ENGINE + ['--no-wasm-baseline']),
+    # CheerpBenchmarker('cheerp-v8-wasm', V8_ENGINE),
+  ]
 
 
 class benchmark(RunnerCore):
   save_dir = True
 
   @classmethod
-  def setUpClass(self):
-    super(benchmark, self).setUpClass()
+  def setUpClass(cls):
+    super(benchmark, cls).setUpClass()
 
     fingerprint = ['ignoring compilation' if IGNORE_COMPILATION else 'including compilation', time.asctime()]
     try:
       fingerprint.append('em: ' + run_process(['git', 'show'], stdout=PIPE).stdout.splitlines()[0])
-    except:
+    except Exception:
       pass
     try:
       with chdir(os.path.expanduser('~/Dev/mozilla-central')):
         fingerprint.append('sm: ' + [line for line in run_process(['hg', 'tip'], stdout=PIPE).stdout.splitlines() if 'changeset' in line][0])
-    except:
+    except Exception:
       pass
     fingerprint.append('llvm: ' + LLVM_ROOT)
     print('Running Emscripten benchmarks... [ %s ]' % ' | '.join(fingerprint))
@@ -404,11 +364,31 @@ class benchmark(RunnerCore):
     assert(os.path.exists(CLOSURE_COMPILER))
 
     Building.COMPILER = CLANG
-    Building.COMPILER_TEST_OPTS = [OPTIMIZATIONS]
 
-  def do_benchmark(self, name, src, expected_output='FAIL', args=[], emcc_args=[], native_args=[], shared_args=[], force_c=False, reps=TEST_REPS, native_exec=None, output_parser=None, args_processor=None, lib_builder=None):
-    if len(benchmarkers) == 0:
-      raise Exception('error, no benchmarkers: ' + benchmarkers_error)
+  # avoid depending on argument reception from the commandline
+  def hardcode_arguments(self, code):
+    if not code or 'int main()' in code:
+      return code
+    main_pattern = 'int main(int argc, char **argv)'
+    assert main_pattern in code
+    code = code.replace(main_pattern, 'int benchmark_main(int argc, char **argv)')
+    code += '''
+      int main() {
+        int newArgc = 2;
+        char* newArgv[] = { (char*)"./program.exe", (char*)"%s" };
+        int ret = benchmark_main(newArgc, newArgv);
+        return ret;
+      }
+    ''' % DEFAULT_ARG
+    return code
+
+  def do_benchmark(self, name, src, expected_output='FAIL', args=[],
+                   emcc_args=[], native_args=[], shared_args=[],
+                   force_c=False, reps=TEST_REPS, native_exec=None,
+                   output_parser=None, args_processor=None, lib_builder=None,
+                   skip_native=False):
+    if not benchmarkers:
+      raise Exception('error, no benchmarkers')
 
     args = args or [DEFAULT_ARG]
     if args_processor:
@@ -416,14 +396,20 @@ class benchmark(RunnerCore):
 
     dirname = self.get_dir()
     filename = os.path.join(dirname, name + '.c' + ('' if force_c else 'pp'))
+    src = self.hardcode_arguments(src)
     with open(filename, 'w') as f:
       f.write(src)
 
     print()
+    baseline = None
     for b in benchmarkers:
+      if skip_native and isinstance(b, NativeBenchmarker):
+        continue
+      baseline = b
+      print('Running benchmarker: ' + b.name)
       b.build(self, filename, args, shared_args, emcc_args, native_args, native_exec, lib_builder, has_output_parser=output_parser is not None)
-      b.bench(args, output_parser, reps)
-      b.display(benchmarkers[0])
+      b.bench(args, output_parser, reps, expected_output)
+      b.display(baseline)
       b.cleanup()
 
   def test_primes(self, check=True):
@@ -466,7 +452,7 @@ class benchmark(RunnerCore):
         return 0;
       }
     '''
-    self.do_benchmark('primes' if check else 'primes-nocheck', src, 'lastprime:' if check else '', shared_args=['-DCHECK'] if check else [])
+    self.do_benchmark('primes' if check else 'primes-nocheck', src, 'lastprime:' if check else '', shared_args=['-DCHECK'] if check else [], emcc_args=['-s', 'MINIMAL_RUNTIME=0'])
 
   # Also interesting to test it without the printfs which allow checking the output. Without
   # printf, code size is dominated by the runtime itself (the compiled code is just a few lines).
@@ -504,7 +490,7 @@ class benchmark(RunnerCore):
         return 0;
       }
     '''
-    self.do_benchmark('memops', src, 'final:')
+    self.do_benchmark('memops', src, 'final:', emcc_args=['-s', 'MINIMAL_RUNTIME=0'])
 
   def zzztest_files(self):
     src = r'''
@@ -513,7 +499,7 @@ class benchmark(RunnerCore):
       #include <assert.h>
       #include <unistd.h>
 
-      int main() {
+      int main(int argc, char **argv) {
         int N = 100;
         int M = 1000;
         int K = 1000;
@@ -614,15 +600,15 @@ class benchmark(RunnerCore):
         return (x++) & 16384;
       }
 
-      int main(int argc, char *argv[]) {
+      int main(int argc, char **argv) {
         int arg = argc > 1 ? argv[1][0] - '0' : 3;
         switch(arg) {
           case 0: return 0; break;
-          case 1: arg = 75; break;
-          case 2: arg = 625; break;
-          case 3: arg = 1250; break;
-          case 4: arg = 5*1250; break;
-          case 5: arg = 10*1250; break;
+          case 1: arg = 5*75; break;
+          case 2: arg = 5*625; break;
+          case 3: arg = 5*1250; break;
+          case 4: arg = 5*5*1250; break;
+          case 5: arg = 5*10*1250; break;
           default: printf("error: %d\\n", arg); return -1;
         }
 
@@ -641,19 +627,19 @@ class benchmark(RunnerCore):
           }
         }
 
-        printf("ok\n");
+        printf("ok %d\n", sum);
 
-        return sum;
+        return 0;
       }
     '''
-    self.do_benchmark('ifs', src, 'ok', reps=TEST_REPS)
+    self.do_benchmark('ifs', src, 'ok')
 
   def test_conditionals(self):
     src = r'''
       #include <stdio.h>
       #include <stdlib.h>
 
-      int main(int argc, char *argv[]) {
+      int main(int argc, char **argv) {
         int arg = argc > 1 ? argv[1][0] - '0' : 3;
         switch(arg) {
           case 0: return 0; break;
@@ -679,10 +665,10 @@ class benchmark(RunnerCore):
 
         printf("ok %d\n", x);
 
-        return x;
+        return 0;
       }
     '''
-    self.do_benchmark('conditionals', src, 'ok', reps=TEST_REPS)
+    self.do_benchmark('conditionals', src, 'ok', reps=TEST_REPS, emcc_args=['-s', 'MINIMAL_RUNTIME=0'])
 
   def test_fannkuch(self):
     src = open(path_from_root('tests', 'fannkuch.cpp'), 'r').read().replace(
@@ -820,7 +806,7 @@ class benchmark(RunnerCore):
   def test_linpack(self):
     def output_parser(output):
       mflops = re.search(r'Unrolled Double  Precision ([\d\.]+) Mflops', output).group(1)
-      return 100.0 / float(mflops)
+      return 10000.0 / float(mflops)
     self.do_benchmark('linpack_double', open(path_from_root('tests', 'linpack2.c')).read(), '''Unrolled Double  Precision''', force_c=True, output_parser=output_parser)
 
   # Benchmarks the synthetic performance of calling native functions.
@@ -907,7 +893,7 @@ class benchmark(RunnerCore):
   def test_matrix_multiply(self):
     def output_parser(output):
       return float(re.search(r'Total elapsed: ([\d\.]+)', output).group(1))
-    self.do_benchmark('matrix_multiply', open(path_from_root('tests', 'matrix_multiply.cpp')).read(), 'Total time:', output_parser=output_parser, shared_args=['-I' + path_from_root('tests')])
+    self.do_benchmark('matrix_multiply', open(path_from_root('tests', 'matrix_multiply.cpp')).read(), 'Total elapsed:', output_parser=output_parser, shared_args=['-I' + path_from_root('tests')])
 
   @non_core
   def test_zzz_java_nbody(self): # tests xmlvm compiled java, including bitcasts of doubles, i64 math, etc.
@@ -990,7 +976,7 @@ class benchmark(RunnerCore):
   def test_zzz_sqlite(self):
     src = open(path_from_root('tests', 'sqlite', 'sqlite3.c'), 'r').read() + open(path_from_root('tests', 'sqlite', 'speedtest1.c'), 'r').read()
 
-    self.do_benchmark('sqlite', src, 'ok.', shared_args=['-I' + path_from_root('tests', 'sqlite')], emcc_args=['-s', 'FILESYSTEM=1'], force_c=True)
+    self.do_benchmark('sqlite', src, 'TOTAL...', shared_args=['-I' + path_from_root('tests', 'sqlite')], emcc_args=['-s', 'FILESYSTEM=1'], force_c=True)
 
   def test_zzz_poppler(self):
     with open('pre.js', 'w') as f:
@@ -1005,12 +991,12 @@ class benchmark(RunnerCore):
           '5': 55,
         };
         if (benchmarkArgument === 0) {
-          Module.arguments = ['-?'];
-          Module.printErr = function(){};
+          Module['arguments'] = ['-?'];
+          Module['printErr'] = function(){};
         } else {
           // Add 'filename' after 'input.pdf' to write the output so it can be verified.
-          Module.arguments = ['-scale-to', '1024', 'input.pdf',  '-f', '1', '-l', '' + benchmarkArgumentToPageCount[benchmarkArgument]];
-          Module.postRun = function() {
+          Module['arguments'] = ['-scale-to', '1024', 'input.pdf',  '-f', '1', '-l', '' + benchmarkArgumentToPageCount[benchmarkArgument]];
+          Module['postRun'] = function() {
             var files = [];
             for (var x in FS.root.contents) {
               if (x.startsWith('filename-')) {
@@ -1033,10 +1019,10 @@ class benchmark(RunnerCore):
       ''' % DEFAULT_ARG)
 
     def lib_builder(name, native, env_init):
-      return [get_poppler_library(self)]
+      return self.get_poppler_library()
 
-    # TODO: poppler in native build
+    # TODO: Fix poppler native build and remove skip_native=True
     self.do_benchmark('poppler', '', 'hashed printout',
                       shared_args=['-I' + path_from_root('tests', 'poppler', 'include'), '-I' + path_from_root('tests', 'freetype', 'include')],
                       emcc_args=['-s', 'FILESYSTEM=1', '--pre-js', 'pre.js', '--embed-file', path_from_root('tests', 'poppler', 'emscripten_html5.pdf') + '@input.pdf', '-s', 'ERROR_ON_UNDEFINED_SYMBOLS=0'],
-                      lib_builder=lib_builder)
+                      lib_builder=lib_builder, skip_native=True)

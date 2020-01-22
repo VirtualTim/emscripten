@@ -22,19 +22,20 @@ function staticAlloc(size) {
 function dynamicAlloc(size) {
 #if ASSERTIONS
   assert(DYNAMICTOP_PTR);
+#if USE_PTHREADS
+  assert(!ENVIRONMENT_IS_PTHREAD); // this function is not thread-safe
+#endif
 #endif
   var ret = HEAP32[DYNAMICTOP_PTR>>2];
   var end = (ret + size + 15) & -16;
-  if (end <= _emscripten_get_heap_size()) {
-    HEAP32[DYNAMICTOP_PTR>>2] = end;
-  } else {
-#if ALLOW_MEMORY_GROWTH
-    var success = _emscripten_resize_heap(end);
-    if (!success) return 0;
+  if (end > _emscripten_get_heap_size()) {
+#if ASSERTIONS
+    abort('failure to dynamicAlloc - memory growth etc. is not supported there, call malloc/sbrk directly');
 #else
-    return 0;
+    abort();
 #endif
   }
+  HEAP32[DYNAMICTOP_PTR>>2] = end;
   return ret;
 }
 
@@ -50,12 +51,15 @@ function warnOnce(text) {
   }
 }
 
+#if !WASM_BACKEND
 var asm2wasmImports = { // special asm2wasm imports
     "f64-rem": function(x, y) {
         return x % y;
     },
     "debugger": function() {
+#if ASSERTIONS // Disable debugger; statement from being present in release builds to avoid Firefox deoptimizations, see https://bugzilla.mozilla.org/show_bug.cgi?id=1538375
         debugger;
+#endif
     }
 #if NEED_ALL_ASM2WASM_IMPORTS
     ,
@@ -76,6 +80,7 @@ var asm2wasmImports = { // special asm2wasm imports
     }
 #endif // NEED_ALL_ASM2WASM_IMPORTS
 };
+#endif
 
 #if RELOCATABLE
 // dynamic linker/loader (a-la ld.so on ELF systems)
@@ -187,14 +192,14 @@ function loadDynamicLibrary(lib, flags) {
       return fetchBinary(lib);
     }
     // load the binary synchronously
-    return Module['readBinary'](lib);
+    return readBinary(lib);
 #else
     // for js we only imitate async for both native & fs modes.
     var libData;
     if (flags.fs) {
       libData = flags.fs.readFile(lib, {encoding: 'utf8'});
     } else {
-      libData = Module['read'](lib);
+      libData = read_(lib);
     }
     return flags.loadAsync ? Promise.resolve(libData) : libData;
 #endif
@@ -259,28 +264,32 @@ function loadDynamicLibrary(lib, flags) {
       // available for symbol resolution of subsequently loaded shared objects.
       //
       // We should copy the symbols (which include methods and variables) from SIDE_MODULE to MAIN_MODULE.
-      //
+
+      var module_sym = sym;
+#if WASM_BACKEND
+      module_sym = '_' + sym;
+#else
       // Module of SIDE_MODULE has not only the symbols (which should be copied)
       // but also others (print*, asmGlobal*, FUNCTION_TABLE_**, NAMED_GLOBALS, and so on).
       //
-      // When the symbol (which should be copied) is method, Module._* 's type becomes function.
-      // When the symbol (which should be copied) is variable, Module._* 's type becomes number.
-      //
+      // When the symbol (which should be copied) is method, Module.* 's type becomes function.
+      // When the symbol (which should be copied) is variable, Module.* 's type becomes number.
       // Except for the symbol prefix (_), there is no difference in the symbols (which should be copied) and others.
       // So this just copies over compiled symbols (which start with _).
       if (sym[0] !== '_') {
         continue;
       }
+#endif
 
-      if (!Module.hasOwnProperty(sym)) {
-        Module[sym] = libModule[sym];
+      if (!Module.hasOwnProperty(module_sym)) {
+        Module[module_sym] = libModule[sym];
       }
 #if ASSERTIONS == 2
       else {
         var curr = Module[sym], next = libModule[sym];
         // don't warn on functions - might be odr, linkonce_odr, etc.
         if (!(typeof curr === 'function' && typeof next === 'function')) {
-          err("warning: trying to dynamically load symbol '" + sym + "' (from '" + lib + "') that already exists (duplicate symbol? or weak linking, which isn't supported yet?)"); // + [curr, ' vs ', next]);
+          err("warning: symbol '" + sym + "' from '" + lib + "' already exists (duplicate symbol? or weak linking, which isn't supported yet?)"); // + [curr, ' vs ', next]);
         }
       }
 #endif
@@ -307,6 +316,42 @@ function loadDynamicLibrary(lib, flags) {
 }
 
 #if WASM
+// Applies relocations to exported things.
+function relocateExports(exports, memoryBase, tableBase, moduleLocal) {
+  var relocated = {};
+
+  for (var e in exports) {
+    var value = exports[e];
+    if (typeof value === 'object') {
+      // a breaking change in the wasm spec, globals are now objects
+      // https://github.com/WebAssembly/mutable-global/issues/1
+      value = value.value;
+    }
+    if (typeof value === 'number') {
+      // relocate it - modules export the absolute value, they can't relocate before they export
+#if EMULATE_FUNCTION_POINTER_CASTS
+      // it may be a function pointer
+      if (e.substr(0, 3) == 'fp$' && typeof exports[e.substr(3)] === 'function') {
+        value = value + tableBase;
+      } else {
+#endif
+        value = value + memoryBase;
+#if EMULATE_FUNCTION_POINTER_CASTS
+      }
+#endif
+    }
+    relocated[e] = value;
+    if (moduleLocal) {
+#if WASM_BACKEND
+      moduleLocal['_' + e] = value;
+#else
+      moduleLocal[e] = value;
+#endif
+    }
+  }
+  return relocated;
+}
+
 // Loads a side module from binary data
 function loadWebAssemblyModule(binary, flags) {
   var int32View = new Uint32Array(new Uint8Array(binary.subarray(0, 24)).buffer);
@@ -386,12 +431,41 @@ function loadWebAssemblyModule(binary, flags) {
     for (var i = tableBase; i < tableBase + tableSize; i++) {
       table.set(i, null);
     }
+
+    // We resolve symbols against the global Module but failing that also
+    // against the local symbols exported a side module.  This is because
+    // a) Module sometime need to import their own symbols
+    // b) Symbols from loaded modules are not always added to the global Module.
+    var moduleLocal = {};
+
+    var resolveSymbol = function(sym, type, legalized) {
+      if (legalized) {
+        sym = 'orig$' + sym;
+      }
+
+      var resolved = Module["asm"][sym];
+      if (!resolved) {
+#if WASM_BACKEND
+        sym = '_' + sym;
+#endif
+        resolved = Module[sym];
+        if (!resolved) {
+          resolved = moduleLocal[sym];
+        }
+#if ASSERTIONS
+        assert(resolved, 'missing linked ' + type + ' `' + sym + '`. perhaps a side module was not linked in? if this global was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment');
+#endif
+     }
+      return resolved;
+    }
+
     // copy currently exported symbols so the new module can import them
     for (var x in Module) {
       if (!(x in env)) {
         env[x] = Module[x];
       }
     }
+
     // TODO kill ↓↓↓ (except "symbols local to this module", it will likely be
     // not needed if we require that if A wants symbols from B it has to link
     // to B explicitly: similarly to -Wl,--no-undefined)
@@ -421,11 +495,24 @@ function loadWebAssemblyModule(binary, flags) {
         if (prop.startsWith('g$')) {
           // a global. the g$ function returns the global address.
           var name = prop.substr(2); // without g$ prefix
-          return env[prop] = function() {
-#if ASSERTIONS
-            assert(Module[name], 'missing linked global ' + name + '. perhaps a side module was not linked in? if this global was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment');
-#endif
-            return Module[name];
+          return obj[prop] = function() {
+            return resolveSymbol(name, 'global');
+          };
+        }
+        if (prop.startsWith('fp$')) {
+          // the fp$ function returns the address (table index) of the function
+          var parts = prop.split('$');
+          assert(parts.length == 3)
+          var name = parts[1];
+          var sig = parts[2];
+          var legalized = sig.indexOf('j') >= 0; // check for i64s
+          var fp = 0;
+          return obj[prop] = function() {
+            if (!fp) {
+              var f = resolveSymbol(name, 'function', legalized);
+              fp = addFunction(f, sig);
+            }
+            return fp;
           };
         }
         if (prop.startsWith('invoke_')) {
@@ -433,25 +520,26 @@ function loadWebAssemblyModule(binary, flags) {
           // present in the dynamic library but not in the main JS,
           // and the dynamic library cannot provide JS for it. Use
           // the generic "X" invoke for it.
-          return env[prop] = invoke_X;
+          return obj[prop] = invoke_X;
         }
-        // if not a global, then a function - call it indirectly
-        return env[prop] = function() {
-#if ASSERTIONS
-          assert(Module[prop], 'missing linked function ' + prop + '. perhaps a side module was not linked in? if this function was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment');
-#endif
-          return Module[prop].apply(null, arguments);
+        // otherwise this is regular function import - call it indirectly
+        return obj[prop] = function() {
+          return resolveSymbol(prop, 'function').apply(null, arguments);
         };
       }
     };
+    var proxy = new Proxy(env, proxyHandler);
     var info = {
       global: {
         'NaN': NaN,
         'Infinity': Infinity,
       },
       'global.Math': Math,
-      env: new Proxy(env, proxyHandler),
+      env: proxy,
+      {{{ WASI_MODULE_NAME }}}: proxy,
+#if !WASM_BACKEND
       'asm2wasm': asm2wasmImports
+#endif
     };
 #if ASSERTIONS
     var oldTable = [];
@@ -460,15 +548,11 @@ function loadWebAssemblyModule(binary, flags) {
     }
 #endif
 
-    function postInstantiation(instance) {
-      var exports = {};
+    function postInstantiation(instance, moduleLocal) {
 #if ASSERTIONS
       // the table should be unchanged
       assert(table === originalTable);
       assert(table === wasmTable);
-      if (instance.exports['table']) {
-        assert(table === instance.exports['table']);
-      }
       // the old part of the table should be unchanged
       for (var i = 0; i < tableBase; i++) {
         assert(table.get(i) === oldTable[i], 'old table entries must remain the same');
@@ -478,28 +562,7 @@ function loadWebAssemblyModule(binary, flags) {
         assert(table.get(tableBase + i) !== undefined, 'table entry was not filled in');
       }
 #endif
-      for (var e in instance.exports) {
-        var value = instance.exports[e];
-        if (typeof value === 'object') {
-          // a breaking change in the wasm spec, globals are now objects
-          // https://github.com/WebAssembly/mutable-global/issues/1
-          value = value.value;
-        }
-        if (typeof value === 'number') {
-          // relocate it - modules export the absolute value, they can't relocate before they export
-#if EMULATE_FUNCTION_POINTER_CASTS
-          // it may be a function pointer
-          if (e.substr(0, 3) == 'fp$' && typeof instance.exports[e.substr(3)] === 'function') {
-            value = value + tableBase;
-          } else {
-#endif
-            value = value + memoryBase;
-#if EMULATE_FUNCTION_POINTER_CASTS
-          }
-#endif
-        }
-        exports[e] = value;
-      }
+      var exports = relocateExports(instance.exports, memoryBase, tableBase, moduleLocal);
       // initialize the module
       var init = exports['__post_instantiate'];
       if (init) {
@@ -515,11 +578,11 @@ function loadWebAssemblyModule(binary, flags) {
 
     if (flags.loadAsync) {
       return WebAssembly.instantiate(binary, info).then(function(result) {
-        return postInstantiation(result.instance);
+        return postInstantiation(result.instance, moduleLocal);
       });
     } else {
       var instance = new WebAssembly.Instance(new WebAssembly.Module(binary), info);
-      return postInstantiation(instance);
+      return postInstantiation(instance, moduleLocal);
     }
   }
 
@@ -599,48 +662,154 @@ Module['registerFunctions'] = registerFunctions;
 #endif // RELOCATABLE
 #endif // EMULATED_FUNCTION_POINTERS
 
-#if EMULATED_FUNCTION_POINTERS == 0
-#if WASM_BACKEND && RESERVED_FUNCTION_POINTERS
-var jsCallStartIndex = {{{ JSCALL_START_INDEX }}};
-var jsCallSigOrder = {{{ JSON.stringify(JSCALL_SIG_ORDER) }}};
-var jsCallNumSigs = Object.keys(jsCallSigOrder).length;
-var functionPointers = new Array(jsCallNumSigs * {{{ RESERVED_FUNCTION_POINTERS }}});
-#else // WASM_BACKEND && RESERVED_FUNCTION_POINTERS == 0
+#if !WASM_BACKEND && EMULATED_FUNCTION_POINTERS == 0
 var jsCallStartIndex = 1;
 var functionPointers = new Array({{{ RESERVED_FUNCTION_POINTERS }}});
-#endif // WASM_BACKEND && RESERVED_FUNCTION_POINTERS
-#endif // EMULATED_FUNCTION_POINTERS == 0
+#endif // !WASM_BACKEND && EMULATED_FUNCTION_POINTERS == 0
 
 #if WASM
+// Wraps a JS function as a wasm function with a given signature.
+function convertJsFunctionToWasm(func, sig) {
+#if WASM2JS
+  return func;
+#else // WASM2JS
+
+  // If the type reflection proposal is available, use the new
+  // "WebAssembly.Function" constructor.
+  // Otherwise, construct a minimal wasm module importing the JS function and
+  // re-exporting it.
+  if (typeof WebAssembly.Function === "function") {
+    var typeNames = {
+      'i': 'i32',
+      'j': 'i64',
+      'f': 'f32',
+      'd': 'f64'
+    };
+    var type = {
+      parameters: [],
+      results: sig[0] == 'v' ? [] : [typeNames[sig[0]]]
+    };
+    for (var i = 1; i < sig.length; ++i) {
+      type.parameters.push(typeNames[sig[i]]);
+    }
+    return new WebAssembly.Function(type, func);
+  }
+
+  // The module is static, with the exception of the type section, which is
+  // generated based on the signature passed in.
+  var typeSection = [
+    0x01, // id: section,
+    0x00, // length: 0 (placeholder)
+    0x01, // count: 1
+    0x60, // form: func
+  ];
+  var sigRet = sig.slice(0, 1);
+  var sigParam = sig.slice(1);
+  var typeCodes = {
+    'i': 0x7f, // i32
+    'j': 0x7e, // i64
+    'f': 0x7d, // f32
+    'd': 0x7c, // f64
+  };
+
+  // Parameters, length + signatures
+  typeSection.push(sigParam.length);
+  for (var i = 0; i < sigParam.length; ++i) {
+    typeSection.push(typeCodes[sigParam[i]]);
+  }
+
+  // Return values, length + signatures
+  // With no multi-return in MVP, either 0 (void) or 1 (anything else)
+  if (sigRet == 'v') {
+    typeSection.push(0x00);
+  } else {
+    typeSection = typeSection.concat([0x01, typeCodes[sigRet]]);
+  }
+
+  // Write the overall length of the type section back into the section header
+  // (excepting the 2 bytes for the section id and length)
+  typeSection[1] = typeSection.length - 2;
+
+  // Rest of the module is static
+  var bytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, // magic ("\0asm")
+    0x01, 0x00, 0x00, 0x00, // version: 1
+  ].concat(typeSection, [
+    0x02, 0x07, // import section
+      // (import "e" "f" (func 0 (type 0)))
+      0x01, 0x01, 0x65, 0x01, 0x66, 0x00, 0x00,
+    0x07, 0x05, // export section
+      // (export "f" (func 0 (type 0)))
+      0x01, 0x01, 0x66, 0x00, 0x00,
+  ]));
+
+   // We can compile this wasm module synchronously because it is very small.
+  // This accepts an import (at "e.f"), that it reroutes to an export (at "f")
+  var module = new WebAssembly.Module(bytes);
+  var instance = new WebAssembly.Instance(module, {
+    'e': {
+      'f': func
+    }
+  });
+  var wrappedFunc = instance.exports['f'];
+  return wrappedFunc;
+#endif // WASM2JS
+}
+
 // Add a wasm function to the table.
-// Attempting to call this with JS function will cause of table.set() to fail
-function addWasmFunction(func) {
+function addFunctionWasm(func, sig) {
   var table = wasmTable;
   var ret = table.length;
-  table.grow(1);
-  table.set(ret, func);
+
+  // Grow the table
+  try {
+    table.grow(1);
+  } catch (err) {
+    if (!(err instanceof RangeError)) {
+      throw err;
+    }
+    throw 'Unable to grow wasm table. Use a higher value for RESERVED_FUNCTION_POINTERS or set ALLOW_TABLE_GROWTH.';
+  }
+
+  // Insert new element
+  try {
+    // Attempting to call this with JS function will cause of table.set() to fail
+    table.set(ret, func);
+  } catch (err) {
+    if (!(err instanceof TypeError)) {
+      throw err;
+    }
+    assert(typeof sig !== 'undefined', 'Missing signature argument to addFunction');
+    var wrapped = convertJsFunctionToWasm(func, sig);
+    table.set(ret, wrapped);
+  }
+
   return ret;
+}
+
+function removeFunctionWasm(index) {
+  // TODO(sbc): Look into implementing this to allow re-using of table slots
 }
 #endif
 
-// 'sig' parameter is currently only used for LLVM backend under certain
-// circumstance: RESERVED_FUNCTION_POINTERS=1, EMULATED_FUNCTION_POINTERS=0.
+// 'sig' parameter is required for the llvm backend but only when func is not
+// already a WebAssembly function.
 function addFunction(func, sig) {
+#if ASSERTIONS
+  assert(typeof func !== 'undefined');
 #if ASSERTIONS == 2
   if (typeof sig === 'undefined') {
     err('warning: addFunction(): You should provide a wasm function signature string as a second argument. This is not necessary for asm.js and asm2wasm, but can be required for the LLVM wasm backend, so it is recommended for full portability.');
   }
+#endif // ASSERTIONS == 2
 #endif // ASSERTIONS
 
+#if WASM_BACKEND
+  return addFunctionWasm(func, sig);
+#else
+
 #if EMULATED_FUNCTION_POINTERS == 0
-#if WASM_BACKEND && RESERVED_FUNCTION_POINTERS
-  assert(typeof sig !== 'undefined',
-         'Second argument of addFunction should be a wasm function signature ' +
-         'string');
-  var base = jsCallSigOrder[sig] * {{{ RESERVED_FUNCTION_POINTERS }}};
-#else // WASM_BACKEND && RESERVED_FUNCTION_POINTERS == 0
   var base = 0;
-#endif // WASM_BACKEND && RESERVED_FUNCTION_POINTERS
   for (var i = base; i < base + {{{ RESERVED_FUNCTION_POINTERS }}}; i++) {
     if (!functionPointers[i]) {
       functionPointers[i] = func;
@@ -652,13 +821,9 @@ function addFunction(func, sig) {
 #else // EMULATED_FUNCTION_POINTERS == 0
 
 #if WASM
-  // assume we have been passed a wasm function and can add it to the table
-  // directly.
-  // TODO(sbc): This assumtion is most likely not valid.  Look into ways of
-  // creating wasm functions based on JS functions as input.
-  return addWasmFunction(func);
+  return addFunctionWasm(func, sig);
 #else
-  alignFunctionTables(); // XXX we should rely on this being an invariant
+  alignFunctionTables(); // TODO: we should rely on this being an invariant
   var tables = getFunctionTables();
   var ret = -1;
   for (var sig in tables) {
@@ -668,21 +833,32 @@ function addFunction(func, sig) {
     table.push(func);
   }
   return ret;
-#endif
+#endif // WASM
 
 #endif // EMULATED_FUNCTION_POINTERS == 0
+#endif // WASM_BACKEND
 }
 
 function removeFunction(index) {
+#if WASM_BACKEND
+  removeFunctionWasm(index);
+#else
+
 #if EMULATED_FUNCTION_POINTERS == 0
   functionPointers[index-jsCallStartIndex] = null;
+#else
+#if WASM
+  removeFunctionWasm(index);
 #else
   alignFunctionTables(); // XXX we should rely on this being an invariant
   var tables = getFunctionTables();
   for (var sig in tables) {
     tables[sig][index] = null;
   }
-#endif
+#endif // WASM
+
+#endif // EMULATE_FUNCTION_POINTER_CASTS == 0
+#endif // WASM_BACKEND
 }
 
 var funcWrappers = {};
@@ -794,11 +970,11 @@ var tempRet0 = 0;
 
 var setTempRet0 = function(value) {
   tempRet0 = value;
-}
+};
 
 var getTempRet0 = function() {
   return tempRet0;
-}
+};
 
 #if RETAIN_COMPILER_SETTINGS
 var compilerSettings = {{{ JSON.stringify(makeRetainedCompilerSettings()) }}} ;
@@ -835,9 +1011,9 @@ GLOBAL_BASE = alignMemory(GLOBAL_BASE, {{{ MAX_GLOBAL_ALIGN || 1 }}});
 #endif
 
 #if WASM_BACKEND && USE_PTHREADS
-// The wasm backend path does not have a way to set the stack max, so we can
-// just implement this function in a trivial way
-function establishStackSpace(base, max) {
+// The wasm backend path does not have a way to set the stack max, so ignore
+// the stack max parameter, this function only resets the stack base.
+function establishStackSpace(base/*, max*/) {
   stackRestore(base);
 }
 

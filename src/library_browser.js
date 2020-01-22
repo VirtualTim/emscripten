@@ -8,8 +8,10 @@
 // Utilities for browser environments
 var LibraryBrowser = {
   $Browser__deps: ['emscripten_set_main_loop', 'emscripten_set_main_loop_timing'],
-  $Browser__postset: 'Module["requestFullScreen"] = function Module_requestFullScreen(lockPointer, resizeCanvas, vrDevice) { err("Module.requestFullScreen is deprecated. Please call Module.requestFullscreen instead."); Module["requestFullScreen"] = Module["requestFullscreen"]; Browser.requestFullScreen(lockPointer, resizeCanvas, vrDevice) };\n' + // exports
-                     'Module["requestFullscreen"] = function Module_requestFullscreen(lockPointer, resizeCanvas, vrDevice) { Browser.requestFullscreen(lockPointer, resizeCanvas, vrDevice) };\n' + // exports
+  $Browser__postset: 'Module["requestFullscreen"] = function Module_requestFullscreen(lockPointer, resizeCanvas, vrDevice) { Browser.requestFullscreen(lockPointer, resizeCanvas, vrDevice) };\n' + // exports
+#if ASSERTIONS
+                     'Module["requestFullScreen"] = function Module_requestFullScreen() { Browser.requestFullScreen() };\n' +
+#endif
                      'Module["requestAnimationFrame"] = function Module_requestAnimationFrame(func) { Browser.requestAnimationFrame(func) };\n' +
                      'Module["setCanvasSize"] = function Module_setCanvasSize(width, height, noUpdates) { Browser.setCanvasSize(width, height, noUpdates) };\n' +
                      'Module["pauseMainLoop"] = function Module_pauseMainLoop() { Browser.mainLoop.pause() };\n' +
@@ -310,10 +312,14 @@ var LibraryBrowser = {
         var contextAttributes = {
           antialias: false,
           alpha: false,
-#if USE_WEBGL2 // library_browser.js defaults: use the WebGL version chosen at compile time (unless overridden below)
+#if MIN_WEBGL_VERSION >= 2
+          majorVersion: 2,
+#else
+#if MAX_WEBGL_VERSION >= 2 // library_browser.js defaults: use the WebGL version chosen at compile time (unless overridden below)
           majorVersion: (typeof WebGL2RenderingContext !== 'undefined') ? 2 : 1,
 #else
           majorVersion: 1,
+#endif
 #endif
         };
 
@@ -370,13 +376,7 @@ var LibraryBrowser = {
         if ((document['fullscreenElement'] || document['mozFullScreenElement'] ||
              document['msFullscreenElement'] || document['webkitFullscreenElement'] ||
              document['webkitCurrentFullScreenElement']) === canvasContainer) {
-          canvas.exitFullscreen = document['exitFullscreen'] ||
-                                  document['cancelFullScreen'] ||
-                                  document['mozCancelFullScreen'] ||
-                                  document['msExitFullscreen'] ||
-                                  document['webkitCancelFullScreen'] ||
-                                  function() {};
-          canvas.exitFullscreen = canvas.exitFullscreen.bind(document);
+          canvas.exitFullscreen = Browser.exitFullscreen;
           if (Browser.lockPointer) canvas.requestPointerLock();
           Browser.isFullscreen = true;
           if (Browser.resizeCanvas) {
@@ -426,12 +426,28 @@ var LibraryBrowser = {
       }
     },
 
-    requestFullScreen: function(lockPointer, resizeCanvas, vrDevice) {
-        err('Browser.requestFullScreen() is deprecated. Please call Browser.requestFullscreen instead.');
-        Browser.requestFullScreen = function(lockPointer, resizeCanvas, vrDevice) {
-          return Browser.requestFullscreen(lockPointer, resizeCanvas, vrDevice);
-        }
-        return Browser.requestFullscreen(lockPointer, resizeCanvas, vrDevice);
+#if ASSERTIONS
+    requestFullScreen: function() {
+      abort('Module.requestFullScreen has been replaced by Module.requestFullscreen (without a capital S)');
+    },
+#endif
+
+    exitFullscreen: function() {
+      // This is workaround for chrome. Trying to exit from fullscreen
+      // not in fullscreen state will cause "TypeError: Document not active"
+      // in chrome. See https://github.com/emscripten-core/emscripten/pull/8236
+      if (!Browser.isFullscreen) {
+        return false;
+      }
+
+      var CFS = document['exitFullscreen'] ||
+                document['cancelFullScreen'] ||
+                document['mozCancelFullScreen'] ||
+                document['msExitFullscreen'] ||
+                document['webkitCancelFullScreen'] ||
+          (function() {});
+      CFS.apply(document, []);
+      return true;
     },
 
     nextRAF: 0,
@@ -450,20 +466,23 @@ var LibraryBrowser = {
       setTimeout(func, delay);
     },
 
-    requestAnimationFrame: function requestAnimationFrame(func) {
-      if (typeof window === 'undefined') { // Provide fallback to setTimeout if window is undefined (e.g. in Node.js)
-        Browser.fakeRequestAnimationFrame(func);
-      } else {
-        if (!window.requestAnimationFrame) {
-          window.requestAnimationFrame = window['requestAnimationFrame'] ||
-                                         window['mozRequestAnimationFrame'] ||
-                                         window['webkitRequestAnimationFrame'] ||
-                                         window['msRequestAnimationFrame'] ||
-                                         window['oRequestAnimationFrame'] ||
-                                         Browser.fakeRequestAnimationFrame;
-        }
-        window.requestAnimationFrame(func);
+    requestAnimationFrame: function(func) {
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(func);
+        return;
       }
+      var RAF = Browser.fakeRequestAnimationFrame;
+#if LEGACY_VM_SUPPORT
+      if (typeof window !== 'undefined') {
+        RAF = window['requestAnimationFrame'] ||
+              window['mozRequestAnimationFrame'] ||
+              window['webkitRequestAnimationFrame'] ||
+              window['msRequestAnimationFrame'] ||
+              window['oRequestAnimationFrame'] ||
+              RAF;
+      }
+#endif
+      RAF(func);
     },
 
     // generic abort-aware wrapper for an async callback
@@ -503,7 +522,7 @@ var LibraryBrowser = {
       });
     },
     safeSetTimeout: function(func, timeout) {
-      Module['noExitRuntime'] = true;
+      noExitRuntime = true;
       return setTimeout(function() {
         if (ABORT) return;
         if (Browser.allowAsyncCallbacks) {
@@ -514,7 +533,7 @@ var LibraryBrowser = {
       }, timeout);
     },
     safeSetInterval: function(func, timeout) {
-      Module['noExitRuntime'] = true;
+      noExitRuntime = true;
       return setInterval(function() {
         if (ABORT) return;
         if (Browser.allowAsyncCallbacks) {
@@ -695,7 +714,7 @@ var LibraryBrowser = {
 
     asyncLoad: function(url, onload, onerror, noRunDep) {
       var dep = !noRunDep ? getUniqueRunDependency('al ' + url) : '';
-      Module['readAsync'](url, function(arrayBuffer) {
+      readAsync(url, function(arrayBuffer) {
         assert(arrayBuffer, 'Loading data file "' + url + '" failed (no arrayBuffer).');
         onload(new Uint8Array(arrayBuffer));
         if (dep) removeRunDependency(dep);
@@ -804,15 +823,15 @@ var LibraryBrowser = {
     }
   },
 
-  emscripten_async_wget__deps: ['$PATH'],
+  emscripten_async_wget__deps: ['$PATH_FS'],
   emscripten_async_wget__proxy: 'sync',
   emscripten_async_wget__sig: 'viiii',
   emscripten_async_wget: function(url, file, onload, onerror) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     var _url = UTF8ToString(url);
     var _file = UTF8ToString(file);
-    _file = PATH.resolve(FS.cwd(), _file);
+    _file = PATH_FS.resolve(_file);
     function doCallback(callback) {
       if (callback) {
         var stack = stackSave();
@@ -857,14 +876,15 @@ var LibraryBrowser = {
     }, true /* no need for run dependency, this is async but will not do any prepare etc. step */ );
   },
 
+  emscripten_async_wget2__deps: ['$PATH_FS'],
   emscripten_async_wget2__proxy: 'sync',
   emscripten_async_wget2__sig: 'iiiiiiiii',
   emscripten_async_wget2: function(url, file, request, param, arg, onload, onerror, onprogress) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     var _url = UTF8ToString(url);
     var _file = UTF8ToString(file);
-    _file = PATH.resolve(FS.cwd(), _file);
+    _file = PATH_FS.resolve(_file);
     var _request = UTF8ToString(request);
     var _param = UTF8ToString(param);
     var index = _file.lastIndexOf('/');
@@ -879,7 +899,7 @@ var LibraryBrowser = {
 
     // LOAD
     http.onload = function http_onload(e) {
-      if (http.status == 200) {
+      if (http.status >= 200 && http.status < 300) {
         // if a file exists there, we overwrite it
         try {
           FS.unlink(_file);
@@ -947,7 +967,7 @@ var LibraryBrowser = {
 
     // LOAD
     http.onload = function http_onload(e) {
-      if (http.status == 200 || _url.substr(0,4).toLowerCase() != "http") {
+      if (http.status >= 200 && http.status < 300 || _url.substr(0,4).toLowerCase() != "http") {
         var byteArray = new Uint8Array(http.response);
         var buffer = _malloc(byteArray.length);
         HEAPU8.set(byteArray, buffer);
@@ -1003,7 +1023,7 @@ var LibraryBrowser = {
   emscripten_run_preload_plugins__proxy: 'sync',
   emscripten_run_preload_plugins__sig: 'iiii',
   emscripten_run_preload_plugins: function(file, onload, onerror) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     var _file = UTF8ToString(file);
     var data = FS.analyzePath(_file);
@@ -1026,7 +1046,7 @@ var LibraryBrowser = {
   emscripten_run_preload_plugins_data__proxy: 'sync',
   emscripten_run_preload_plugins_data__sig: 'viiiiii',
   emscripten_run_preload_plugins_data: function(data, size, suffix, arg, onload, onerror) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     var _suffix = UTF8ToString(suffix);
     if (!Browser.asyncPrepareDataCounter) Browser.asyncPrepareDataCounter = 0;
@@ -1052,7 +1072,7 @@ var LibraryBrowser = {
   // Callable from pthread, executes in pthread context.
   emscripten_async_run_script__deps: ['emscripten_run_script'],
   emscripten_async_run_script: function(script, millis) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     // TODO: cache these to avoid generating garbage
     Browser.safeSetTimeout(function() {
@@ -1071,7 +1091,7 @@ var LibraryBrowser = {
       return onerror ? onerror() : undefined;
     }
 #endif
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     assert(runDependencies === 0, 'async_load_script must be run when no other dependencies are active');
     var script = document.createElement('script');
@@ -1156,7 +1176,7 @@ var LibraryBrowser = {
   emscripten_set_main_loop__deps: ['emscripten_set_main_loop_timing', 'emscripten_get_now'],
 #endif
   emscripten_set_main_loop: function(func, fps, simulateInfiniteLoop, arg, noSetTiming) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     assert(!Browser.mainLoop.func, 'emscripten_set_main_loop: there can only be one main loop function at once: call emscripten_cancel_main_loop to cancel the previous one before setting a new one with different parameters.');
 
@@ -1238,10 +1258,12 @@ var LibraryBrowser = {
       }
 #endif
 
+#if ASSERTIONS
       if (Browser.mainLoop.method === 'timeout' && Module.ctx) {
-        err('Looks like you are rendering without using requestAnimationFrame for the main loop. You should use 0 for the frame rate in emscripten_set_main_loop in order to use requestAnimationFrame, as that can greatly improve your frame rates!');
+        warnOnce('Looks like you are rendering without using requestAnimationFrame for the main loop. You should use 0 for the frame rate in emscripten_set_main_loop in order to use requestAnimationFrame, as that can greatly improve your frame rates!');
         Browser.mainLoop.method = ''; // just warn once per call to set main loop
       }
+#endif
 
       Browser.mainLoop.runIter(browserIterationFunc);
 
@@ -1269,7 +1291,7 @@ var LibraryBrowser = {
     }
 
     if (simulateInfiniteLoop) {
-      throw 'SimulateInfiniteLoop';
+      throw 'unwind';
     }
   },
 
@@ -1320,7 +1342,7 @@ var LibraryBrowser = {
 
   // Runs natively in pthread, no __proxy needed.
   emscripten_async_call: function(func, arg, millis) {
-    Module['noExitRuntime'] = true;
+    noExitRuntime = true;
 
     function wrapper() {
       getFuncWrapper(func, 'vi')(arg);
@@ -1335,8 +1357,8 @@ var LibraryBrowser = {
 
   // Callable in pthread without __proxy needed.
   emscripten_exit_with_live_runtime: function() {
-    Module['noExitRuntime'] = true;
-    throw 'SimulateInfiniteLoop';
+    noExitRuntime = true;
+    throw 'unwind';
   },
 
   emscripten_force_exit__proxy: 'sync',
@@ -1347,7 +1369,7 @@ var LibraryBrowser = {
     warnOnce('emscripten_force_exit cannot actually shut down the runtime, as the build does not have EXIT_RUNTIME set');
 #endif
 #endif
-    Module['noExitRuntime'] = false;
+    noExitRuntime = false;
     exit(status);
   },
 
@@ -1435,7 +1457,7 @@ var LibraryBrowser = {
   emscripten_call_worker__proxy: 'sync',
   emscripten_call_worker__sig: 'viiiiii',
   emscripten_call_worker: function(id, funcName, data, size, callback, arg) {
-    Module['noExitRuntime'] = true; // should we only do this if there is a callback?
+    noExitRuntime = true; // should we only do this if there is a callback?
 
     funcName = UTF8ToString(funcName);
     var info = Browser.workers[id];
@@ -1501,13 +1523,13 @@ var LibraryBrowser = {
     return info.awaited;
   },
 
-  emscripten_get_preloaded_image_data__deps: ['$PATH'],
+  emscripten_get_preloaded_image_data__deps: ['$PATH_FS'],
   emscripten_get_preloaded_image_data__proxy: 'sync',
   emscripten_get_preloaded_image_data__sig: 'iiii',
   emscripten_get_preloaded_image_data: function(path, w, h) {
     if ((path | 0) === path) path = UTF8ToString(path);
 
-    path = PATH.resolve(path);
+    path = PATH_FS.resolve(path);
 
     var canvas = Module["preloadedImages"][path];
     if (canvas) {
